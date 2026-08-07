@@ -227,7 +227,21 @@ class SessionManager:
         # Capture and STT connect start IN PARALLEL; frames captured before
         # the socket opens buffer inside the stream (cap ~15 s, drop oldest).
         session.owns_audio = True
-        self._audio.start(lambda pcm, rms: self._on_frame(session, pcm, rms))
+        try:
+            self._audio.start(lambda pcm, rms: self._on_frame(session, pcm, rms))
+        except Exception:
+            # A missing/vanished loopback device must surface actionably, not
+            # as a generic pipeline error.
+            session.owns_audio = False
+            self._fail(
+                session,
+                AppError(
+                    "internal",
+                    "Could not open the system audio device. Check that a "
+                    "default output device exists, then try again.",
+                ),
+            )
+            return
         try:
             await stream.connect()
         except asyncio.CancelledError:

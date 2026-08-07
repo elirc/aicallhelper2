@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (217 tests)
-cd frontend && npm test                        # frontend (82 tests)
+.venv\Scripts\python -m pytest tests -q        # core (232 tests)
+cd frontend && npm test                        # frontend (86 tests)
 ```
 
 ---
@@ -434,6 +434,62 @@ TestRecordCap:
 - **test_manual_stop_cancels_the_cap** — no phantom autostop after a normal
   stop.
 
+TestAudioFailure:
+
+- **test_audio_start_failure_surfaces_actionably_and_frees_the_slot** — a
+  loopback device that fails to open surfaces "Could not open the system
+  audio device…" (never the raw exception text), and the slot releases so
+  the next attempt works once the device is back. Why: the generic
+  "internal error" this replaced sent users hunting through logs for what
+  is usually just "no default output device".
+
+### tests/test_bridge.py — the pywebview bridge
+
+JsApi (driven synchronously from a foreign thread against a live loop, the
+way pywebview drives it):
+
+- **test_ok_envelope / test_app_error_becomes_error_envelope** — commands
+  resolve `{ok, value}` / `{ok:false, error:{code,message}}`; nothing
+  throws across the language boundary.
+- **test_unexpected_exception_never_leaks_its_text** — a raw RuntimeError
+  becomes a generic `internal` message; exception text is not user copy.
+- **test_type_validation_rejected_without_reaching_the_loop** — wrong-typed
+  arguments (non-string ask/stop ids, non-dict patch) fail fast in the
+  worker thread.
+- **test_cancel_is_fire_and_forget_and_reaches_the_machine /
+  test_cancel_with_bad_id_type_is_still_ok** — cancel returns ok
+  immediately, is delivered via `call_soon_threadsafe`, and invalid input
+  is never an error (the caller doesn't await it meaningfully).
+- **test_get_settings_merges_hotkey_registration_state** — the runtime
+  `hotkeyRegistered` flag rides on the settings view.
+- **test_set_settings_notifies_and_a_failing_hook_never_fails_the_save** —
+  window/hotkey application errors must not turn a successful save into a
+  reported failure.
+- **test_heartbeat_updates_liveness** — the crash-recovery watchdog's
+  signal actually moves.
+- **test_open_external_https_only** — https opens in the default browser;
+  http/javascript:/non-strings are refused (the app never navigates its
+  own webview).
+
+WebviewEventSink (fake window capturing evaluate_js):
+
+- **test_events_arrive_in_emission_order_with_payloads_intact** — five
+  deltas with quotes/backslashes/newlines/unicode arrive in order and
+  byte-identical after the double-JSON-encoding round trip. Why: event
+  ordering is a correctness property (scrambled deltas scramble the
+  answer), and naive string interpolation into evaluate_js corrupts
+  payloads.
+- **test_events_before_attach_are_held_not_dropped** — events emitted
+  before the window exists wait for attach instead of vanishing.
+- **test_a_throwing_webview_does_not_kill_the_pump** — a dying renderer
+  breaks one dispatch, not the event stream.
+
+### tests/test_providers.py — TestDefaultRegistry
+
+- **test_ships_both_providers_anthropic_first** — the shipped registry
+  contains exactly anthropic (first = recommended default) and groq, with
+  the display names the Settings select renders.
+
 ### tests/test_deepgram_client.py — DeepgramStream over loopback WebSockets
 
 - **test_interim_then_final_updates_and_closestream_flush** — subprotocol
@@ -637,3 +693,17 @@ TestRecordCap:
 - **first-run nudge for missing SELECTED-provider key; no nudge when only an
   unselected provider's key is missing** — the nudge tracks what would
   actually block a recording.
+
+### src/__tests__/app-copy.test.tsx — the Copy button
+
+- **copies the markdown SOURCE and confirms** — the clipboard receives the
+  raw markdown (bullets survive pasting), "Copied ✓" shows, and the screen-
+  reader announcement fires.
+- **falls back to execCommand when navigator.clipboard is missing** — the
+  packaged app loads from file://, a non-secure context where
+  `navigator.clipboard` is undefined; without the textarea+execCommand
+  fallback, Copy fails only in the shipped build (the worst kind of bug —
+  invisible in dev).
+- **surfaces clipboard failure in the error box** — a denied clipboard is
+  reported, not swallowed; no false "Copied ✓".
+- **hidden until an answer exists** — visibility rule.

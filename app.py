@@ -56,8 +56,17 @@ def app_data_dir() -> Path:
 # --------------------------------------------------------------- crash log
 
 
+CRASH_LOG_MAX_BYTES = 1_000_000
+
+
 def install_crash_logging(data_dir: Path) -> None:
     log_path = data_dir / "crash.log"
+    try:
+        # Rotate once at boot so the log can't grow without bound.
+        if log_path.exists() and log_path.stat().st_size > CRASH_LOG_MAX_BYTES:
+            log_path.replace(data_dir / "crash.log.1")
+    except OSError:
+        pass
     handle = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - lives for the process
     faulthandler.enable(file=handle)
 
@@ -174,6 +183,7 @@ class App:
         self.hotkey = HotkeyManager(self._on_hotkey)
         self._bounds_timer: threading.Timer | None = None
         self._last_reload = 0.0
+        self._current_accelerator: str | None = None
         self._entry_url = resolve_entry_url()
 
         self.http = httpx.AsyncClient(
@@ -226,8 +236,12 @@ class App:
         self.loop.call_soon_threadsafe(self.sink.emit, "hotkey:toggle", {})
 
     def _apply_settings(self, view: dict[str, Any]) -> None:
-        accelerator = view.get("hotkey") or ""
-        self.hotkey.register(str(accelerator))
+        accelerator = str(view.get("hotkey") or "")
+        # Re-registering an unchanged hotkey briefly unbinds it (and can lose
+        # it to another app in the gap) — only touch the OS when it changed.
+        if accelerator != self._current_accelerator:
+            self.hotkey.register(accelerator)
+            self._current_accelerator = accelerator
         if self.window is not None:
             with contextlib.suppress(Exception):
                 self.window.on_top = bool(view.get("alwaysOnTop", True))
@@ -342,6 +356,7 @@ class App:
 
         watch_focus_signal(self._hwnd)
         accelerator = str(view.get("hotkey") or "")
+        self._current_accelerator = accelerator
         if accelerator:
             self.hotkey.register(accelerator)
         self.start_loop_thread()

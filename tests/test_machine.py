@@ -471,6 +471,31 @@ class TestSlotRelease:
         assert len(h.sink.named("llm:done")) == 2
 
 
+class TestAudioFailure:
+    async def test_audio_start_failure_surfaces_actionably_and_frees_the_slot(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        real_start = h.audio.start
+
+        def boom(on_frame: object) -> None:
+            raise RuntimeError("no loopback device")
+
+        h.audio.start = boom  # type: ignore[method-assign]
+        await h.machine.start_session()
+        await h.drain(0.3)
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1
+        assert "audio device" in errors[0]["error"]["message"]
+        assert "no loopback device" not in errors[0]["error"]["message"]  # no raw text
+        # Slot released: with the device back, the next session works.
+        h.audio.start = real_start  # type: ignore[method-assign]
+        sid = await start_and_connect(h)
+        await h.machine.stop_session(sid)
+        await h.drain()
+        assert len(h.sink.named("llm:done")) == 1
+
+
 class TestRecordCap:
     async def test_cap_auto_stops_and_answers_normally(self) -> None:
         h = Harness(

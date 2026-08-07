@@ -183,6 +183,21 @@ class TestProviderConformance:
         assert provider.is_retryable(ValueError()) is False
 
 
+class TestDefaultRegistry:
+    def test_ships_both_providers_anthropic_first(self) -> None:
+        from app_core.llm.base import default_registry
+
+        registry = default_registry()
+        assert registry.ids() == ["anthropic", "groq"]
+        choices = registry.choices()
+        assert choices[0] == {
+            "id": "anthropic",
+            "displayName": "Claude Haiku 4.5 (recommended)",
+        }
+        assert registry.get("groq") is not None
+        assert registry.get("nope") is None
+
+
 class TestAnthropicSpecifics:
     provider = AnthropicProvider()
 

@@ -51,7 +51,8 @@ a thin React view hosted in a pywebview (WebView2) window.
 5. **Package**
 
    ```
-   .venv\Scripts\pyinstaller aica.spec            # windowed build in dist/AICallAssistant/
+   powershell -ExecutionPolicy Bypass -File build.ps1    # checks + frontend + PyInstaller
+   .venv\Scripts\pyinstaller aica.spec                   # or just the app build
    ```
 
    `installer.iss` (Inno Setup) wraps the PyInstaller output into an
@@ -135,8 +136,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
 ## Testing
 
 ```
-.venv\Scripts\python -m pytest tests -q      # 217 core tests
-cd frontend && npm test                       # 82 frontend tests
+.venv\Scripts\python -m pytest tests -q      # 232 core tests
+cd frontend && npm test                       # 86 frontend tests
 .venv\Scripts\python -m ruff check app_core app.py tests
 .venv\Scripts\python -m mypy                  # strict, on the core
 cd frontend && npm run typecheck              # TS strict

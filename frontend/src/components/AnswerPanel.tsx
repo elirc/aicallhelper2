@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { Entry } from "../App";
+import { copyToClipboard } from "../clipboard";
 import { formatLatencyChip, formatLatencyTitle } from "../format";
 import { Markdown } from "../markdown/Markdown";
 
@@ -56,7 +57,7 @@ export function AnswerPanel({
   const copy = async () => {
     try {
       // The markdown SOURCE — bullets survive pasting.
-      await navigator.clipboard.writeText(answer);
+      await copyToClipboard(answer);
       setCopied(true);
       onAnnounce("Answer copied to clipboard");
       window.setTimeout(() => setCopied(false), 1200);
