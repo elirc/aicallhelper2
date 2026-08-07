@@ -330,3 +330,168 @@ class TestKeepalive:
             assert messages[messages.index("CloseStream") + 1 :] == []
         finally:
             box.server.close()
+
+
+class TestFinalizeOrderingAndCleanup:
+    async def test_closestream_never_overtakes_queued_audio(self) -> None:
+        """CloseStream travels the audio queue, so it is written after every
+        frame already queued. Deepgram discards audio arriving after
+        CloseStream, so overtaking silently truncates the tail."""
+        order: list[str] = []
+
+        async def handler(ws: ServerConnection) -> None:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    order.append(f"audio:{message.decode()}")
+                    continue
+                if json.loads(message).get("type") == "CloseStream":
+                    order.append("close")
+                    await ws.send(results_frame("done", True))
+                    await ws.close()
+                    return
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec)
+            await stream.connect()
+            for i in range(20):
+                stream.send(str(i).encode())
+            await stream.finalize()  # queued immediately behind the 20 frames
+            assert order[-1] == "close"
+            assert order[:20] == [f"audio:{i}" for i in range(20)]
+        finally:
+            box.server.close()
+
+    async def test_finalize_leaves_no_pending_tasks(self) -> None:
+        # The sender used to park on the queue forever after finalize, pinning
+        # the socket for the life of the process.
+        async def handler(ws: ServerConnection) -> None:
+            async for message in ws:
+                if isinstance(message, str) and json.loads(message).get("type") == "CloseStream":
+                    await ws.send(results_frame("done", True))
+                    await ws.close()
+                    return
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec)
+            await stream.connect()
+            await stream.finalize()
+            await asyncio.sleep(0.1)
+            pending = [t for t in stream._tasks if not t.done()]
+            assert pending == []
+        finally:
+            box.server.close()
+
+    async def test_unresponsive_server_finalize_still_cleans_up(self) -> None:
+        async def handler(ws: ServerConnection) -> None:
+            await ws.send(results_frame("heard this", True))
+            async for _ in ws:
+                pass  # never closes
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec, finalize_timeout=0.2)
+            await stream.connect()
+            await asyncio.sleep(0.05)
+            assert await stream.finalize() == "heard this"
+            await asyncio.sleep(0.1)
+            assert [t for t in stream._tasks if not t.done()] == []
+        finally:
+            box.server.close()
+
+    async def test_bad_key_close_during_finalize_keeps_connect_classification(self) -> None:
+        # User presses Record then Stop immediately; Deepgram rejects the key
+        # by closing. "Lost the connection while finalizing" would send them
+        # debugging the network instead of the key.
+        release = asyncio.Event()
+
+        async def handler(ws: ServerConnection) -> None:
+            await release.wait()
+            await ws.close(code=1008, reason="DATA-0001")
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec, finalize_timeout=1.0)
+            await stream.connect()
+            finalize = asyncio.get_running_loop().create_task(stream.finalize())
+            await asyncio.sleep(0.05)
+            release.set()
+            await finalize
+            await asyncio.sleep(0.1)
+            assert len(rec.errors) == 1
+            assert rec.errors[0].code == "stt_connect"
+            assert "API key" in rec.errors[0].message
+        finally:
+            box.server.close()
+
+
+class TestProductionWireConstants:
+    def test_url_pins_every_required_query_parameter(self) -> None:
+        from urllib.parse import parse_qs, urlsplit
+
+        from app_core.stt.client import DEEPGRAM_URL
+
+        parts = urlsplit(DEEPGRAM_URL)
+        assert parts.scheme == "wss" and parts.netloc == "api.deepgram.com"
+        assert parts.path == "/v1/listen"
+        assert parse_qs(parts.query) == {
+            "model": ["nova-3"],
+            "encoding": ["linear16"],
+            "sample_rate": ["16000"],
+            "channels": ["1"],
+            "interim_results": ["true"],
+            "smart_format": ["true"],
+        }
+
+    async def test_the_api_key_is_offered_as_the_second_subprotocol(self) -> None:
+        # Asserting only subprotocol == "token" would still pass if the key
+        # were dropped from the offer.
+        seen: list[str] = []
+
+        async def handler(ws: ServerConnection) -> None:
+            header = ws.request.headers.get("Sec-WebSocket-Protocol", "")  # type: ignore[union-attr]
+            seen.append(header)
+            await ws.close()
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = DeepgramStream("secret-dg-key", rec.on_update, rec.on_error, url=box.url)
+            await stream.connect()
+            await asyncio.sleep(0.15)
+            assert seen and "token" in seen[0] and "secret-dg-key" in seen[0]
+        finally:
+            box.server.close()
+
+    async def test_no_keepalive_can_follow_closestream(self) -> None:
+        # The old assertion was a tautology: the handler returned on
+        # CloseStream, so nothing could ever be recorded after it.
+        messages: list[str] = []
+
+        async def handler(ws: ServerConnection) -> None:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    continue
+                messages.append(json.loads(message).get("type", "?"))
+                # Deliberately keeps reading after CloseStream.
+            return
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec, keepalive_interval=0.05, finalize_timeout=0.3)
+            await stream.connect()
+            await asyncio.sleep(0.16)
+            await stream.finalize()
+            await asyncio.sleep(0.25)  # several more keepalive periods
+            assert "CloseStream" in messages
+            after = messages[messages.index("CloseStream") + 1 :]
+            assert after == [], f"messages after CloseStream: {after}"
+            assert messages.count("KeepAlive") >= 2
+        finally:
+            box.server.close()

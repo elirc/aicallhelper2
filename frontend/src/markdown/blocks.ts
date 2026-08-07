@@ -64,7 +64,11 @@ function startsOtherBlock(line: string): boolean {
 }
 
 export function parseBlocks(source: string): Block[] {
-  const lines = source.split("\n");
+  // Normalize line endings first. Every block regex below is `$`-anchored and
+  // neither `.` nor `[ \t]` matches `\r`, so a CRLF document would degrade
+  // EVERY construct — headings, rules, both list kinds, opening fences — into
+  // paragraphs, silently rendering something other than what the model wrote.
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
   const blocks: Block[] = [];
   let i = 0;
 
@@ -204,8 +208,13 @@ export function blockSignature(block: Block): string {
     case "hr":
       return "hr";
     case "list":
-      return `l:${block.ordered ? block.start : "-"}:${block.loose ? 1 : 0}:${block.items
-        .map((item) => item.text)
-        .join("\u001f")}`;
+      // JSON.stringify, not a joined separator: item text is untrusted model
+      // output, so ANY separator character can appear inside it (U+001F is an
+      // ordinary character that trim() and \s both leave alone). A collision
+      // here is not cosmetic — BlockView memoizes on this signature, so two
+      // different lists sharing one signature leave stale DOM on screen.
+      return `l:${block.ordered ? block.start : "-"}:${block.loose ? 1 : 0}:${JSON.stringify(
+        block.items.map((item) => item.text),
+      )}`;
   }
 }

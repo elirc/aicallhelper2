@@ -40,12 +40,16 @@ class PreWarmer:
 
         Returns the task (for tests) or None when throttled.
         """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None  # "never raises" holds even when called off-loop
         now = self._clock()
         last = self._last_warm.get(origin)
         if last is not None and now - last < self._throttle_s:
             return None
         self._last_warm[origin] = now
-        return asyncio.get_running_loop().create_task(self._do_warm(origin))
+        return loop.create_task(self._do_warm(origin))
 
     async def _do_warm(self, origin: str) -> None:
         # httpx .get reads the body to completion before returning, which is

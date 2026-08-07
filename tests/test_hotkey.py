@@ -46,3 +46,27 @@ class TestParseAccelerator:
         assert parse_accelerator("Ctrl+Foo") is None
         assert parse_accelerator("A+B") is None  # two keys
         assert parse_accelerator("F25") is None
+
+
+class TestHostileAccelerators:
+    def test_multi_char_uppercase_returns_none_instead_of_raising(self) -> None:
+        # "ß".upper() == "SS", which used to make ord() raise TypeError. That
+        # escaped hotkey registration at launch and bricked startup until
+        # settings.json was hand-edited.
+        assert parse_accelerator("ctrl+ß") is None
+        assert parse_accelerator("ﬁ") is None
+
+    def test_non_ascii_keys_rejected_rather_than_mapped_to_bogus_vks(self) -> None:
+        # Win32 VK codes are ASCII-based; ord("é") == 0xC9 is unassigned and
+        # ord("日") is out of range entirely.
+        assert parse_accelerator("ctrl+é") is None
+        assert parse_accelerator("ctrl+日") is None
+        assert parse_accelerator("ctrl+€") is None
+
+    def test_ascii_keys_still_work(self) -> None:
+        assert parse_accelerator("ctrl+a") is not None
+        assert parse_accelerator("ctrl+9") is not None
+
+    def test_no_accelerator_input_ever_raises(self) -> None:
+        for candidate in ["ß", "+++", "ctrl+", "ctrl++", "\x00", "🙂", "ctrl+🙂", " " * 5]:
+            parse_accelerator(candidate)  # must not raise

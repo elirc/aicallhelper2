@@ -98,3 +98,17 @@ class TestHostileChunking:
         # CR|LF split across chunks must not dispatch the event twice or
         # fabricate an empty line that dispatches early.
         assert parse_all([b"data: a\r", b"\ndata: b\r\n", b"\r\n"]) == ["a\nb"]
+
+
+class TestByteOrderMark:
+    def test_leading_bom_is_stripped_not_fused_onto_the_first_field(self) -> None:
+        # Left in place, U+FEFF makes the first line's field "﻿data",
+        # which is not "data" — the stream's first event vanishes.
+        assert parse_all([b"\xef\xbb\xbfdata: first\n\n"]) == ["first"]
+
+    def test_bom_split_across_chunks(self) -> None:
+        assert parse_all([b"\xef", b"\xbb\xbfdata: x\n\n"]) == ["x"]
+
+    def test_only_a_leading_bom_is_stripped(self) -> None:
+        # A BOM mid-stream is ordinary data and must survive verbatim.
+        assert parse_all([b"data: a\n\ndata: \xef\xbb\xbfb\n\n"]) == ["a", "﻿b"]

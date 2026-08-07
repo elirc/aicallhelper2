@@ -8,6 +8,7 @@ after finalize.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -519,3 +520,102 @@ class TestRecordCap:
         await h.machine.stop_session(sid)
         await h.drain()
         assert h.sink.named("session:autostopped") == []
+
+
+class TestCommandTicket:
+    async def test_an_earlier_command_stalled_on_its_key_read_never_supersedes_a_later_one(
+        self, harness: Harness
+    ) -> None:
+        # Rule 2 across the WHOLE command, not just the connect: the key read
+        # hits DPAPI and can stall. An earlier press resuming late must not
+        # kill the session the user asked for afterwards.
+        h = harness
+        gate = threading.Event()
+        first = {"pending": True}
+        real_get = h.settings.get_secret
+
+        def stalling_get(secret_id: str) -> str | None:
+            if first["pending"]:
+                first["pending"] = False
+                gate.wait(timeout=5.0)  # only the very first read stalls
+            return real_get(secret_id)
+
+        h.settings.get_secret = stalling_get  # type: ignore[method-assign]
+        early = asyncio.get_running_loop().create_task(h.machine.start_session())
+        await h.settle()
+        later_sid = await h.machine.ask("the question I actually want answered")
+        gate.set()
+        with pytest.raises(AppError) as info:
+            await early
+        assert info.value.code == "aborted"  # silent in the UI
+        await h.drain()
+        done = h.sink.named("llm:done")
+        assert [d["sessionId"] for d in done] == [later_sid]
+        assert h.sink.named("session:error") == []
+
+    async def test_a_lone_command_is_never_self_superseded(self, harness: Harness) -> None:
+        h = harness
+        sid = await start_and_connect(h)
+        await h.machine.stop_session(sid)
+        await h.drain()
+        assert len(h.sink.named("llm:done")) == 1
+
+
+class TestErrorSuppression:
+    async def test_nothing_but_the_error_is_emitted_once_a_session_failed(
+        self, harness: Harness
+    ) -> None:
+        # Rule 9 structurally: _emit itself refuses non-error events from a
+        # failed session, so a delta racing a timeout cannot paint.
+        h = harness
+        sid = await start_and_connect(h)
+        stt = h.stt.last
+        stt.on_error(AppError("stt_error", "died"))
+        await h.settle()
+        stt.on_update("late transcript", True)  # would repaint the question
+        await h.settle()
+        events = [n for n, p in h.sink.for_session(sid)]
+        assert events.count("session:error") == 1
+        assert "stt:partial" not in events[events.index("session:error") :]
+
+    async def test_mid_finalize_stt_death_tears_the_session_down(
+        self, harness: Harness
+    ) -> None:
+        # Rule 5 first half, in the finalize window (previously untested).
+        h = harness
+        finalize_gate = asyncio.Event()
+        h.stt.prepare = lambda s: setattr(s, "finalize_gate", finalize_gate)
+        sid = await start_and_connect(h)
+        stt = h.stt.last
+        await h.machine.stop_session(sid)
+        await h.settle()
+        stt.on_error(AppError("stt_error", "socket died while finalizing"))
+        await h.settle()
+        finalize_gate.set()
+        await h.drain()
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "stt_error"
+        assert h.sink.named("llm:done") == []
+        assert h.provider.stream_calls == 0  # never answered a truncated question
+
+
+class TestStopContractExtra:
+    async def test_stop_during_answering_is_not_taken(self, harness: Harness) -> None:
+        h = harness
+        h.provider.post_delta_hang = asyncio.Event()
+        sid = await start_and_connect(h)
+        await h.machine.stop_session(sid)
+        await asyncio.sleep(0.05)  # now answering
+        with pytest.raises(AppError):
+            await h.machine.stop_session(sid)
+        h.provider.post_delta_hang.set()
+        await h.drain()
+
+    async def test_stop_of_an_ask_session_is_not_taken(self, harness: Harness) -> None:
+        h = harness
+        h.provider.post_delta_hang = asyncio.Event()
+        sid = await h.machine.ask("typed")
+        with pytest.raises(AppError):
+            await h.machine.stop_session(sid)
+        h.provider.post_delta_hang.set()
+        await h.drain()

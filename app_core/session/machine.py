@@ -137,10 +137,17 @@ class SessionManager:
         self._clock = clock
         self._active: _Session | None = None
         self._counter = 0
+        # Rule 2 claim ticket. The slot itself can only be claimed after the
+        # key reads (they must fail the COMMAND, not a session), so the claim
+        # of "newest" is this counter, taken synchronously at command entry —
+        # before any await. Without it a command whose DPAPI read stalls could
+        # resume and supersede a command the user issued LATER.
+        self._command_seq = 0
 
     # ------------------------------------------------------------- commands
 
     async def start_session(self) -> str:
+        ticket = self._claim_ticket()
         stt_key = await asyncio.to_thread(self._settings.get_secret, DEEPGRAM_SECRET_ID)
         if not stt_key:
             raise AppError(
@@ -155,8 +162,10 @@ class SessionManager:
                 f"No API key for {provider.display_name}. "
                 "Open Settings (gear icon) and add it.",
             )
-        # Rule 1 (supersession) + rule 2 (latest-start-wins): claim "newest"
-        # synchronously, BEFORE any await the connect path performs.
+        # Rule 1 (supersession) + rule 2 (latest-start-wins): the ticket was
+        # claimed before the awaits above; if a newer command took one since,
+        # this start lost and must not install itself over the winner.
+        self._require_ticket(ticket)
         self._supersede()
         session = self._new_session("record")
         self._active = session
@@ -189,6 +198,7 @@ class SessionManager:
             raise AppError("internal", "Type a question first.")
         if len(trimmed) > 8000:
             raise AppError("internal", "Question is too long (max 8000 characters).")
+        ticket = self._claim_ticket()  # after validation (rule 8), before any await
         provider = self._active_provider()
         llm_key = await asyncio.to_thread(self._settings.get_secret, provider.id)
         if not llm_key:
@@ -197,6 +207,7 @@ class SessionManager:
                 f"No API key for {provider.display_name}. "
                 "Open Settings (gear icon) and add it.",
             )
+        self._require_ticket(ticket)
         self._supersede()
         session = self._new_session("ask")
         session.phase = "answering"
@@ -489,6 +500,16 @@ class SessionManager:
             raise AppError("internal", "Unknown answer provider — pick one in Settings.")
         return provider
 
+    def _claim_ticket(self) -> int:
+        self._command_seq += 1
+        return self._command_seq
+
+    def _require_ticket(self, ticket: int) -> None:
+        if self._command_seq != ticket:
+            # A newer command claimed while we were awaiting. Report `aborted`,
+            # which the UI never shows — the user's newer action is in charge.
+            raise AppError("aborted", "Superseded by a newer request.")
+
     def _new_session(self, kind: Literal["record", "ask"]) -> _Session:
         self._counter += 1
         return _Session(id=f"s{self._counter}", kind=kind)
@@ -548,6 +569,10 @@ class SessionManager:
         # Rule 1: events from a superseded session are dropped — including
         # its done.
         if session.aborted:
+            return
+        # Rule 9, structurally: once a session has failed, the only thing it
+        # may still emit is its own error. Nothing paints after the error.
+        if session.errored and name != "session:error":
             return
         self._events.emit(name, {"sessionId": session.id, **payload})
 

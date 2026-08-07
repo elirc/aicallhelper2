@@ -90,6 +90,11 @@ def classify_openai_failure(
         return AppError(
             "llm_http", f"Could not reach {provider_label}. Check your internet connection."
         )
+    if failure.kind == "timeout":
+        return AppError(
+            "llm_http",
+            f"{provider_label} did not respond in time. Check your connection and try again.",
+        )
     if failure.kind == "stream_drop":
         return AppError(
             "llm_http",

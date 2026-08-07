@@ -26,11 +26,21 @@ class SSEParser:
         self._line_buf = ""
         self._data_lines: list[str] = []
         self._pending_cr = False
+        self._at_start = True
 
     def feed(self, chunk: bytes) -> list[str]:
         text = self._decoder.decode(chunk)
         if not text:
             return []
+        if self._at_start:
+            self._at_start = False
+            # Strip one leading BOM (per the SSE spec). Left in place it fuses
+            # onto the first field name, so "﻿data" != "data" and the
+            # stream's first event is silently dropped.
+            if text.startswith("﻿"):
+                text = text[1:]
+                if not text:
+                    return []
         return self._feed_text(text)
 
     def flush(self) -> list[str]:

@@ -67,3 +67,13 @@ class TestPreWarm:
         task = warmer.warm("https://down.example")
         assert task is not None
         await task  # swallows the ConnectError
+
+
+class TestOffLoop:
+    def test_warm_outside_a_running_loop_returns_none_instead_of_raising(self) -> None:
+        # The contract is "a failed warm costs nothing and must never raise";
+        # asyncio.get_running_loop() raises RuntimeError off-loop.
+        log: list[str] = []
+        warmer, _clock = make(log)
+        assert warmer.warm("https://a.example") is None
+        assert log == []

@@ -16,7 +16,19 @@ type Token =
   | { t: "text"; s: string }
   | { t: "code"; s: string }
   | { t: "delim"; ch: "*" | "_"; count: number; canOpen: boolean; canClose: boolean }
-  | { t: "node"; node: InlineNode };
+  | { t: "node"; node: InlineNode; depth: number };
+
+/**
+ * Model output is untrusted and its emphasis nesting is attacker-controlled.
+ * Unbounded nesting recurses through mergeText and the renderer's node walk,
+ * and `*`-dense text makes emphasis resolution quadratic — either one can
+ * blank the whole app (React unmounts the root on a RangeError) or freeze
+ * the UI mid-answer. Past these bounds the remaining delimiters render as
+ * literal text, which is a cosmetic loss on input no real answer produces.
+ */
+const MAX_EMPHASIS_DEPTH = 24;
+const MAX_EMPHASIS_NODES = 1000;
+const MAX_EMPHASIS_CHARS = 20_000;
 
 const PUNCT_RE = /[!-/:-@[-`{-~]/;
 
@@ -134,6 +146,12 @@ function tokenToNodes(token: Token): InlineNode[] {
 
 function resolveEmphasis(tokens: Token[]): InlineNode[] {
   const work: Token[] = tokens.slice();
+  // Lowest index that can still hold an opener, per delimiter char. Without
+  // it, every closer that finds no opener re-scans the whole array, which is
+  // quadratic on delimiter-dense text. Splices only ever happen at or above
+  // the floor, so indices below it never shift and the floor stays valid.
+  const openerFloor: Record<string, number> = { "*": 0, _: 0 };
+  let resolved = 0;
   let closerIdx = 0;
   while (closerIdx < work.length) {
     const closer = work[closerIdx];
@@ -141,9 +159,11 @@ function resolveEmphasis(tokens: Token[]): InlineNode[] {
       closerIdx += 1;
       continue;
     }
+    if (resolved >= MAX_EMPHASIS_NODES) break;
     // Nearest preceding opener of the same character.
+    const floor = openerFloor[closer.ch] ?? 0;
     let openerIdx = -1;
-    for (let k = closerIdx - 1; k >= 0; k -= 1) {
+    for (let k = closerIdx - 1; k >= floor; k -= 1) {
       const candidate = work[k];
       if (
         candidate &&
@@ -157,20 +177,31 @@ function resolveEmphasis(tokens: Token[]): InlineNode[] {
       }
     }
     if (openerIdx === -1) {
+      // This closer can still open for a later closer, so the floor includes it.
+      openerFloor[closer.ch] = closerIdx;
       closerIdx += 1;
+      continue;
+    }
+    const innerTokens = work.slice(openerIdx + 1, closerIdx);
+    let childDepth = 0;
+    for (const token of innerTokens) {
+      if (token.t === "node" && token.depth > childDepth) childDepth = token.depth;
+    }
+    if (childDepth + 1 > MAX_EMPHASIS_DEPTH) {
+      closerIdx += 1; // too deep to wrap — these delimiters stay literal
       continue;
     }
     const opener = work[openerIdx] as Extract<Token, { t: "delim" }>;
     const use = opener.count >= 2 && closer.count >= 2 ? 2 : 1;
-    const innerTokens = work.slice(openerIdx + 1, closerIdx);
     const children = innerTokens.flatMap(tokenToNodes);
     const node: InlineNode =
       use === 2 ? { kind: "strong", children } : { kind: "em", children };
     opener.count -= use;
     closer.count -= use;
+    resolved += 1;
     const replacement: Token[] = [];
     if (opener.count > 0) replacement.push(opener);
-    replacement.push({ t: "node", node });
+    replacement.push({ t: "node", node, depth: childDepth + 1 });
     if (closer.count > 0) replacement.push(closer);
     work.splice(openerIdx, closerIdx - openerIdx + 1, ...replacement);
     closerIdx = openerIdx; // re-scan from the replacement site
@@ -195,5 +226,10 @@ function mergeText(nodes: InlineNode[]): InlineNode[] {
 }
 
 export function parseInline(source: string): InlineNode[] {
-  return mergeText(resolveEmphasis(scan(source)));
+  const tokens = scan(source);
+  // Past the size guard, emphasis resolution is skipped entirely (delimiters
+  // stay literal). Code spans and escapes still work, and every string is
+  // still a text node — the security contract is unaffected.
+  if (source.length > MAX_EMPHASIS_CHARS) return mergeText(tokens.flatMap(tokenToNodes));
+  return mergeText(resolveEmphasis(tokens));
 }

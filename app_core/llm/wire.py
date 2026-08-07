@@ -61,6 +61,11 @@ async def stream_sse_data(
     except httpx.HTTPError as exc:
         if response_started:
             raise ProviderFailure("stream_drop", detail=str(exc)) from exc
-        raise ProviderFailure("connect", detail=str(exc)) from exc
+        if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
+            # The request never left us: safe to retry.
+            raise ProviderFailure("connect", detail=str(exc)) from exc
+        # Anything else pre-response (notably ReadTimeout after the body was
+        # written) means the server may have heard us — not retryable.
+        raise ProviderFailure("timeout", detail=str(exc)) from exc
     if not produced:
         raise ProviderFailure("empty_body")

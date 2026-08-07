@@ -110,8 +110,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
      (URL, headers, serialized body); it must be deterministic, it is reused
      verbatim on retry,
    - `stream(request, http)` — async-yield answer text deltas; raise
-     `ProviderFailure` with the right `kind` ("connect" | "status" |
-     "stream_drop" | "empty_body"),
+     `ProviderFailure` with the right `kind` ("connect" | "timeout" |
+     "status" | "stream_drop" | "empty_body"),
    - `classify_error(failure)` — map to the closed error-code set with an
      actionable message (check `asyncio.CancelledError` FIRST → `aborted`),
    - `is_retryable(failure)` — `True` only for connection-level failures.
@@ -136,8 +136,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
 ## Testing
 
 ```
-.venv\Scripts\python -m pytest tests -q      # 232 core tests
-cd frontend && npm test                       # 86 frontend tests
+.venv\Scripts\python -m pytest tests -q      # 261 core tests
+cd frontend && npm test                       # 112 frontend tests
 .venv\Scripts\python -m ruff check app_core app.py tests
 .venv\Scripts\python -m mypy                  # strict, on the core
 cd frontend && npm run typecheck              # TS strict
@@ -188,10 +188,10 @@ LLM.
 
 - **Global hotkey**: implemented directly over Win32 `RegisterHotKey` via
   ctypes (`app_core/bridge/hotkey.py`) instead of the `global_hotkeys`
-  package. Reason: the product contract requires honest registration-failure
+  package, which is therefore not a dependency and not in the install line.
+  Reason: the product contract requires honest registration-failure
   reporting (key taken → visible notice), which the wrapper packages don't
-  expose reliably. The package remains listed in the install line for
-  optional experimentation but is unused.
+  expose reliably.
 - **Repo layout**: the spec sketches the core package under `core/`; it
   lives at the repo root as `app_core/` (same subpackage structure:
   `audio/ stt/ llm/ session/ store/ bridge/`) so imports match the package
@@ -207,3 +207,13 @@ LLM.
 - **CSP**: `style-src` includes `'unsafe-inline'` — pywebview/WebView2's
   bootstrap requires it; model content still never contributes markup,
   attributes, or styles.
+- **Error kinds**: providers classify wire failures into five kinds
+  (`connect` · `timeout` · `status` · `stream_drop` · `empty_body`). Only
+  `connect` is retryable — a read timeout while waiting for response headers
+  means the server may already be generating the answer, so retrying could
+  produce a doubled answer.
+- **Markdown limits**: emphasis nesting is capped (24 deep, 1000 pairs, and
+  emphasis resolution is skipped past 20 000 characters). Model output is
+  untrusted and unbounded nesting overflowed the render stack, which
+  unmounts the whole React root. A `MarkdownBoundary` falls back to plain
+  text if rendering ever throws anyway.

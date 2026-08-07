@@ -227,3 +227,76 @@ class TestAtomicity:
         store.set_window_bounds({"x": 10, "y": 20, "width": 500, "height": 600})
         reloaded = make_store(store_path)
         assert reloaded.window_bounds() == {"x": 10, "y": 20, "width": 500, "height": 600}
+
+
+class TestConcurrentWriters:
+    def test_a_bounds_save_racing_a_patch_never_loses_either_writer(
+        self, store_path: Path
+    ) -> None:
+        """Realistic trigger: the user drags the window (debounced bounds
+        save on a timer thread) and clicks Save within the same half second.
+        Unsynchronized read-modify-write dropped one writer's fields from BOTH
+        disk and the in-memory cache."""
+        import threading
+
+        store = make_store(store_path)
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2, timeout=10)
+
+        def save_keys() -> None:
+            try:
+                barrier.wait()
+                for i in range(40):
+                    store.patch({"keys": {"deepgram": f"dg-{i}"}, "resume": f"r{i}"})
+            except BaseException as exc:
+                errors.append(exc)
+
+        def save_bounds() -> None:
+            try:
+                barrier.wait()
+                for i in range(40):
+                    store.set_window_bounds({"x": i, "y": i, "width": 500, "height": 600})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=save_keys),
+            threading.Thread(target=save_bounds),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert errors == []
+        # Both writers' last values survived, in memory AND on disk.
+        assert store.get_secret("deepgram") == "dg-39"
+        assert store.view()["resume"] == "r39"
+        assert store.window_bounds() is not None
+        reloaded = make_store(store_path)
+        assert reloaded.get_secret("deepgram") == "dg-39"
+        assert reloaded.view()["resume"] == "r39"
+        assert reloaded.window_bounds() is not None
+
+    def test_no_stray_tmp_files_are_left_behind(self, store_path: Path) -> None:
+        store = make_store(store_path)
+        store.patch({"resume": "x"})
+        assert list(store_path.parent.glob("*.tmp")) == []
+
+
+class TestKeyCharsetValidation:
+    def test_non_ascii_key_is_refused_with_an_actionable_message(
+        self, store_path: Path
+    ) -> None:
+        # Smart quotes / hidden characters from copy-paste cannot go in an
+        # HTTP header: httpx raises UnicodeEncodeError at send time, which
+        # would surface as a useless "internal error" mid-answer.
+        store = make_store(store_path)
+        with pytest.raises(AppError) as info:
+            store.patch({"keys": {"deepgram": "sk-café"}})
+        assert "ASCII" in info.value.message
+        assert store.get_secret("deepgram") is None
+
+    def test_ascii_keys_with_punctuation_still_accepted(self, store_path: Path) -> None:
+        store = make_store(store_path)
+        store.patch({"keys": {"deepgram": "sk-ant_api03-AbC.123-_xyz"}})
+        assert store.get_secret("deepgram") == "sk-ant_api03-AbC.123-_xyz"

@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (232 tests)
-cd frontend && npm test                        # frontend (86 tests)
+.venv\Scripts\python -m pytest tests -q        # core (261 tests)
+cd frontend && npm test                        # frontend (112 tests)
 ```
 
 ---
@@ -707,3 +707,103 @@ WebviewEventSink (fake window capturing evaluate_js):
 - **surfaces clipboard failure in the error box** — a denied clipboard is
   reported, not swallowed; no false "Copied ✓".
 - **hidden until an answer exists** — visibility rule.
+
+---
+
+## Regression tests from the 15-agent audit (2026-08-07)
+
+An adversarial multi-agent audit found bugs the suites above could not see —
+each of these tests exists because a specific one of them shipped.
+
+### Core
+
+- **test_machine.py::TestCommandTicket::test_an_earlier_command_stalled_on_its_key_read_never_supersedes_a_later_one**
+  — rule 2 applied to the WHOLE command, not just the connect. The key read
+  hits DPAPI and can stall; an earlier Record press resuming late used to
+  supersede the Ask the user typed afterwards, killing it silently. The
+  losing command now reports `aborted` (never shown by the UI).
+- **…::test_a_lone_command_is_never_self_superseded** — the ticket must not
+  make ordinary single commands abort themselves.
+- **TestErrorSuppression::test_nothing_but_the_error_is_emitted_once_a_session_failed**
+  — rule 9 made structural: `_emit` now refuses every non-error event from a
+  failed session, so a delta racing a timeout cannot paint. Previously only
+  a guard inside `on_delta` enforced this, and deleting that guard broke no
+  test.
+- **…::test_mid_finalize_stt_death_tears_the_session_down** — rule 5's first
+  half in the finalize window (previously only mid-recording and
+  post-finalize were covered): the provider must never be asked to answer a
+  truncated question.
+- **TestStopContractExtra::test_stop_during_answering_is_not_taken /
+  test_stop_of_an_ask_session_is_not_taken** — two stop-contract rows the
+  original matrix missed.
+- **TestAudioFailure::test_audio_start_failure_surfaces_actionably_and_frees_the_slot**
+  — a loopback device that fails to open said "internal error"; now it names
+  the device, leaks no exception text, and releases the slot.
+- **test_deepgram_client.py::test_closestream_never_overtakes_queued_audio**
+  — CloseStream used to be written directly on the socket while audio went
+  through a queue. Under send backpressure it overtook queued frames, and
+  Deepgram discards audio arriving after CloseStream: the tail of the
+  question was silently lost. It now travels the same queue.
+- **…::test_finalize_leaves_no_pending_tasks /
+  test_unresponsive_server_finalize_still_cleans_up** — the sender task used
+  to park on the queue forever after finalize, pinning the socket for the
+  process lifetime.
+- **…::test_bad_key_close_during_finalize_keeps_connect_classification** —
+  Record-then-immediately-Stop with a bad key reported "lost the connection
+  while finalizing", sending the user to debug their network instead of the
+  key.
+- **TestProductionWireConstants::test_url_pins_every_required_query_parameter**
+  — nothing pinned the production URL; every test injected its own.
+- **…::test_the_api_key_is_offered_as_the_second_subprotocol** — asserting
+  only `subprotocol == "token"` still passes if the key is dropped.
+- **…::test_no_keepalive_can_follow_closestream** — replaces a tautological
+  assertion (the old handler returned on CloseStream, so nothing could ever
+  be recorded after it); this one keeps reading.
+- **test_sse.py::TestByteOrderMark (3 tests)** — a leading UTF-8 BOM fused
+  onto the first field name, silently dropping the stream's first event.
+- **test_hotkey.py::TestHostileAccelerators (4 tests)** — `"ß".upper()` is
+  `"SS"`, so `ord()` raised TypeError; the exception escaped registration at
+  launch and bricked startup until settings.json was hand-edited. Non-ASCII
+  keys also mapped to unassigned Win32 VK codes.
+- **test_settings.py::TestConcurrentWriters::test_a_bounds_save_racing_a_patch_never_loses_either_writer**
+  — drag the window, then click Save within half a second: the unsynchronized
+  read-modify-write dropped one writer's fields from disk AND cache. Also
+  **test_no_stray_tmp_files_are_left_behind** (per-writer tmp names).
+- **TestKeyCharsetValidation (2 tests)** — a key with a smart quote reached
+  httpx and raised UnicodeEncodeError mid-answer, surfacing as "internal
+  error"; it is now refused at save time with a message naming the cause.
+- **test_providers.py::TestPreResponseTimeoutIsNotRetryable (2×2 tests)** — a
+  read timeout waiting for response headers was classified `connect` and
+  therefore retried, even though the server may already be generating the
+  answer. Only genuine connect failures retry.
+- **test_warm.py::TestOffLoop** — `warm()` raised RuntimeError off-loop,
+  contradicting "never raises".
+
+### Frontend
+
+- **markdown-hardening.test.tsx — hostile-input hardening (5 tests)** —
+  deeply nested emphasis (`*`×12000) overflowed the render stack, and React
+  unmounts the entire root on an uncaught render error: one answer could
+  blank the app mid-call. Delimiter-dense text was quadratic (18 KB froze
+  the main thread for ~59 s). Now capped, with the normal-emphasis case
+  pinned so the caps can't silently break real answers.
+- **…CRLF normalization (3 tests)** — every block regex is `$`-anchored and
+  cannot match a trailing `\r`, so a CRLF answer degraded EVERY construct
+  (headings, rules, both list kinds, opening fences) into paragraphs.
+- **…block signature identity (3 tests)** — the list signature joined item
+  text with a separator that can itself appear in model output, so `- ab`
+  and `- a\n- b` collided; `BlockView` then memoized away a real change and
+  left stale DOM on screen.
+- **app-gestures.test.tsx — Record during each phase (5 tests)** — the
+  starting→silent-abort path (including cancelling the late-resolving
+  session and ignoring its events), finalizing→ignored, answering→supersede,
+  and both `aborted` command results rendering nothing.
+- **…delta coalescing and ordering (2 tests)** — deltas fired in the same
+  tick as a terminal event must flush first, or the answer flickers/jumps.
+- **…answer panel scrolling (3 tests)** — the 28 px sticky-bottom rule: it
+  follows the stream when you're at the bottom and never yanks you down when
+  you scrolled up to re-read.
+- **…accessibility wiring (3 tests)** — `aria-live`/`aria-busy` transitions
+  on the answer panel, `role="status"`, `role="alert"`.
+- **…copy confirmation timing** — "Copied ✓" reverts to "Copy".
+- **…history guards** — Clear is disabled while a session is live.

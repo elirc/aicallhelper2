@@ -17,7 +17,11 @@ import httpx
 from app_core.errors import AppError
 from app_core.llm.prompt import PromptParts
 
-FailureKind = Literal["connect", "status", "stream_drop", "empty_body"]
+# "connect" is the ONLY retryable kind: it means the request never reached the
+# server. "timeout" is deliberately separate — a read timeout waiting for
+# response headers means the server may already be working on our request, so
+# retrying could produce a second answer and would burn the latency budget.
+FailureKind = Literal["connect", "timeout", "status", "stream_drop", "empty_body"]
 
 
 @dataclass

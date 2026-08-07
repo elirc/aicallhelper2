@@ -88,7 +88,12 @@ def parse_accelerator(accelerator: str) -> ParsedAccelerator | None:
             modifiers |= _MODIFIERS[part]
         elif vk is not None:
             return None  # two non-modifier keys
-        elif len(part) == 1 and (part.isalnum() or part in _NAMED_KEYS):
+        elif len(part) == 1 and (part in _NAMED_KEYS or (part.isascii() and part.isalnum())):
+            # ASCII only, deliberately. Win32 VK codes are ASCII-based, so a
+            # non-ASCII character yields an unassigned VK — and 'ß'.upper() is
+            # "SS", which used to make ord() raise TypeError. That exception
+            # escaped registration at launch and bricked startup until
+            # settings.json was hand-edited.
             vk = _NAMED_KEYS.get(part, ord(part.upper()))
         elif part in _NAMED_KEYS:
             vk = _NAMED_KEYS[part]
@@ -122,7 +127,10 @@ class HotkeyManager:
             self._unregister_locked()
             if not accelerator:
                 return False
-            parsed = parse_accelerator(accelerator)
+            try:
+                parsed = parse_accelerator(accelerator)
+            except Exception:
+                return False  # a hand-edited settings file must never brick launch
             if parsed is None:
                 return False
             result: dict[str, bool] = {}

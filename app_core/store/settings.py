@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,12 @@ class SettingsStore:
         self._path = path
         self._keystore = keystore
         self._registry = registry
+        # Writers run on different threads (patch via asyncio.to_thread from
+        # the bridge; window bounds from a debounce timer and the close
+        # handler). Without this lock the read-modify-write of the whole
+        # settings dict interleaves and one writer's fields — a just-saved API
+        # key, or the resume — vanish from BOTH disk and the cache.
+        self._lock = threading.RLock()
         self._data = self._load()
 
     # -------------------------------------------------------------- loading
@@ -101,10 +108,16 @@ class SettingsStore:
         mid-write must not truncate the file into "defaults". The in-memory
         cache updates only AFTER the write lands, so a failed write leaves
         memory matching disk."""
-        tmp = Path(str(self._path) + ".tmp")
+        # Per-writer tmp name: two concurrent writers sharing one tmp path can
+        # interleave bytes before either os.replace lands.
+        tmp = Path(f"{self._path}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self._path)
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         self._data = data
 
     # ------------------------------------------------------------------ API
@@ -129,6 +142,10 @@ class SettingsStore:
     def patch(self, patch: Mapping[str, object]) -> dict[str, Any]:
         """Validated patch; returns the fresh view. Invalid values raise
         AppError (the bridge turns it into an error Result envelope)."""
+        with self._lock:
+            return self._patch_locked(patch)
+
+    def _patch_locked(self, patch: Mapping[str, object]) -> dict[str, Any]:
         data = dict(self._data)
         if "resume" in patch:
             data["resume"] = _require_profile_text(patch["resume"], "Resume")
@@ -173,6 +190,16 @@ class SettingsStore:
                 if not isinstance(key_value, str):
                     raise AppError("internal", "API keys must be text.")
                 trimmed_key = key_value.strip()
+                if not trimmed_key.isascii():
+                    # Non-ASCII cannot go in an HTTP header: httpx would raise
+                    # a UnicodeEncodeError at send time, surfacing as a
+                    # useless "internal error" mid-answer. Refuse at the door
+                    # with a message that names the real problem.
+                    raise AppError(
+                        "internal",
+                        "API keys must be plain ASCII — check for smart quotes "
+                        "or hidden characters from copy-paste.",
+                    )
                 if not trimmed_key:
                     # An empty (or whitespace-only) key value CLEARS the
                     # stored key; omitting the field leaves it untouched.
@@ -204,9 +231,10 @@ class SettingsStore:
         """Geometry is cosmetic data: saving it must NEVER raise (some of
         these saves happen during shutdown)."""
         try:
-            data = dict(self._data)
-            data["windowBounds"] = dict(bounds)
-            self._save(data)
+            with self._lock:
+                data = dict(self._data)
+                data["windowBounds"] = dict(bounds)
+                self._save(data)
         except Exception:
             pass
 

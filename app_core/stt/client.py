@@ -61,6 +61,11 @@ PREOPEN_MAX_FRAMES = 120
 KEEPALIVE_MSG = '{"type":"KeepAlive"}'
 CLOSESTREAM_MSG = '{"type":"CloseStream"}'
 
+# Queue sentinel: CloseStream travels the SAME path as audio so it can never
+# overtake frames still queued behind a stalled send (Deepgram discards audio
+# that arrives after CloseStream, so overtaking silently truncates the tail).
+_CLOSE_SENTINEL = object()
+
 
 class DeepgramStream:
     def __init__(
@@ -84,7 +89,7 @@ class DeepgramStream:
 
         self._acc = TranscriptAccumulator()
         self._preopen: deque[bytes] = deque(maxlen=PREOPEN_MAX_FRAMES)
-        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[bytes | object] = asyncio.Queue()
         self._ws: ClientConnection | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._closed_evt = asyncio.Event()
@@ -94,6 +99,7 @@ class DeepgramStream:
         self._error_reported = False
         self._got_results = False
         self._finalize_task: asyncio.Task[str] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -119,7 +125,8 @@ class DeepgramStream:
         loop = asyncio.get_running_loop()
         self._tasks.append(loop.create_task(self._reader()))
         self._tasks.append(loop.create_task(self._sender()))
-        self._tasks.append(loop.create_task(self._keepalive()))
+        self._keepalive_task = loop.create_task(self._keepalive())
+        self._tasks.append(self._keepalive_task)
         # Flush frames captured while the socket was opening, in order.
         while self._preopen:
             self._queue.put_nowait(self._preopen.popleft())
@@ -161,12 +168,20 @@ class DeepgramStream:
             # Never opened or already died: return what we have immediately
             # rather than burning the timeout.
             return self._acc.text
-        with contextlib.suppress(Exception):
-            await ws.send(CLOSESTREAM_MSG)
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()  # nothing may touch a CLOSING socket
+        # Behind any frames still in flight, never ahead of them.
+        self._queue.put_nowait(_CLOSE_SENTINEL)
         with contextlib.suppress(TimeoutError):
             # The server flushes its held-back tail (smart_format entity
             # hold-back included) then closes; 5 s cap.
             await asyncio.wait_for(self._closed_evt.wait(), self._finalize_timeout)
+        # The sender exits after writing CloseStream; if the cap fired first it
+        # is still parked on the queue, so cancel it rather than leak a task
+        # pinning the socket for the process lifetime.
+        for task in self._tasks:
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
         return self._acc.text
 
     async def _reader(self) -> None:
@@ -211,6 +226,18 @@ class DeepgramStream:
             # Expected close during finalize/abort — but an ABNORMAL close
             # mid-finalize is a stream death and must surface (rule 5; the
             # machine ignores it once the transcript is finalized).
+            if abnormal_close and not self._aborted and not self._got_results:
+                # Never transcribed anything: this is the bad-key rejection
+                # (1008 DATA-xxxx), which must keep its connect-failure
+                # classification even though a stop was already requested.
+                self._report_error(
+                    AppError(
+                        "stt_connect",
+                        f"Deepgram closed the connection{close_detail}. "
+                        "Check the API key and your network.",
+                    )
+                )
+                return
             if abnormal_close and not self._aborted:
                 self._report_error(
                     AppError(
@@ -245,9 +272,11 @@ class DeepgramStream:
         assert ws is not None
         while True:
             item = await self._queue.get()
-            if item is None:
-                return
             try:
+                if item is _CLOSE_SENTINEL:
+                    await ws.send(CLOSESTREAM_MSG)
+                    return  # drained: every queued frame was written first
+                assert isinstance(item, bytes)
                 await ws.send(item)
             except Exception:
                 return  # the reader observes and classifies the death

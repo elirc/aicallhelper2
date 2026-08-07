@@ -14,8 +14,8 @@ interface Props {
   onRegenerate: () => void;
   onCopyError: (message: string) => void;
   onAnnounce: (text: string) => void;
-  /** Changes when the viewed history entry changes — resets scroll to top. */
-  viewKey: number;
+  /** Identity of the viewed history entry — a change resets scroll to top. */
+  viewKey: string;
 }
 
 export function AnswerPanel({

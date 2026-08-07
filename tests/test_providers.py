@@ -304,3 +304,37 @@ class TestGroqSpecifics:
         assert extract_openai_delta('{"choices":[]}') is None
         assert extract_openai_delta("not json") is None
         assert extract_openai_delta('{"choices":[{"delta":{"content":5}}]}') is None
+
+
+class TestPreResponseTimeoutIsNotRetryable:
+    """A read timeout waiting for response headers means the server may
+    already be generating our answer; retrying could produce a second answer
+    and burns the latency budget. Only a genuine connect failure is safe."""
+
+    @pytest.mark.parametrize(
+        "provider", [AnthropicProvider(), GroqProvider()], ids=lambda p: p.id
+    )
+    async def test_read_timeout_before_response_is_kind_timeout(
+        self, provider: AnswerProvider
+    ) -> None:
+        def raise_read_timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out waiting for headers", request=request)
+
+        with pytest.raises(ProviderFailure) as info:
+            await collect(provider, client_returning(raise_read_timeout))
+        assert info.value.kind == "timeout"
+        assert provider.is_retryable(info.value) is False
+        err = provider.classify_error(info.value)
+        assert err.code == "llm_http" and "time" in err.message.lower()
+
+    @pytest.mark.parametrize(
+        "provider", [AnthropicProvider(), GroqProvider()], ids=lambda p: p.id
+    )
+    async def test_connect_error_stays_retryable(self, provider: AnswerProvider) -> None:
+        def raise_connect(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+        with pytest.raises(ProviderFailure) as info:
+            await collect(provider, client_returning(raise_connect))
+        assert info.value.kind == "connect"
+        assert provider.is_retryable(info.value) is True

@@ -385,7 +385,9 @@ export default function App() {
     callInFlightRef.current = false;
     if (!result.ok) {
       bufferRef.current = [];
-      dispatch({ type: "start-failed", error: result.error });
+      // `aborted` means a newer command superseded this one — always silent.
+      if (result.error.code === "aborted") dispatch({ type: "start-aborted" });
+      else dispatch({ type: "start-failed", error: result.error });
       return;
     }
     if (abortStartRef.current) {
@@ -439,8 +441,12 @@ export default function App() {
       callInFlightRef.current = false;
       if (!result.ok) {
         bufferRef.current = [];
-        dispatch({ type: "error-set", error: result.error });
-        return; // input kept so the user can retry
+        // `aborted` is silent (superseded); the input stays either way so the
+        // user can retry.
+        if (result.error.code !== "aborted") {
+          dispatch({ type: "error-set", error: result.error });
+        }
+        return;
       }
       adoptSession(result.value, {
         type: "ask-accepted",
@@ -654,7 +660,10 @@ export default function App() {
           dispatch({ type: "error-set", error: { code: "internal", message } })
         }
         onAnnounce={(text) => dispatch({ type: "announce", text })}
-        viewKey={state.view}
+        // Entry identity, not the view index: with a full history the index
+        // stays put while the entry underneath it changes, and scroll would
+        // never reset.
+        viewKey={viewed?.id ?? ""}
       />
 
       {state.error && (

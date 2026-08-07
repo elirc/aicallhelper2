@@ -121,6 +121,11 @@ class AnthropicProvider:
                 return AppError(
                     "llm_http", "Could not reach Anthropic. Check your internet connection."
                 )
+            if failure.kind == "timeout":
+                return AppError(
+                    "llm_http",
+                    "Anthropic did not respond in time. Check your connection and try again.",
+                )
             if failure.kind == "stream_drop":
                 return AppError(
                     "llm_http",

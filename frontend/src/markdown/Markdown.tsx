@@ -7,7 +7,7 @@
  * - completed blocks keep their DOM nodes across streaming updates: block
  *   index keys + per-block memo on a content signature.
  */
-import { memo, useMemo, type ReactNode } from "react";
+import { Component, memo, useMemo, type ReactNode } from "react";
 
 import { parseBlocks, blockSignature, type Block } from "./blocks";
 import { parseInline, type InlineNode } from "./inline";
@@ -86,7 +86,7 @@ const BlockView = memo(
   (prev, next) => prev.signature === next.signature,
 );
 
-export const Markdown = memo(function Markdown({ source }: { source: string }) {
+const MarkdownBlocks = memo(function MarkdownBlocks({ source }: { source: string }) {
   const blocks = useMemo(() => parseBlocks(source), [source]);
   return (
     <>
@@ -96,3 +96,38 @@ export const Markdown = memo(function Markdown({ source }: { source: string }) {
     </>
   );
 });
+
+/**
+ * Last line of defense: an uncaught render error unmounts the entire React
+ * root, so a single pathological answer would blank the app mid-call. Falling
+ * back to the raw source keeps the answer readable and still text-only.
+ */
+class MarkdownBoundary extends Component<
+  { source: string; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  componentDidUpdate(prev: { source: string }): void {
+    if (this.state.failed && prev.source !== this.props.source) {
+      this.setState({ failed: false }); // new content deserves a fresh attempt
+    }
+  }
+
+  render(): ReactNode {
+    if (this.state.failed) return <pre className="answer-fallback">{this.props.source}</pre>;
+    return this.props.children;
+  }
+}
+
+export function Markdown({ source }: { source: string }) {
+  return (
+    <MarkdownBoundary source={source}>
+      <MarkdownBlocks source={source} />
+    </MarkdownBoundary>
+  );
+}
