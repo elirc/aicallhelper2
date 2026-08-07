@@ -1,0 +1,199 @@
+/**
+ * Inline markdown parsing: bold, italic (CommonMark-ish flanking rules —
+ * snake_case must not italicize), inline code (backtick runs with
+ * exact-length closers, one space of padding stripped), backslash escapes.
+ * Links are NOT parsed. Output is plain data; every string becomes a DOM
+ * text node in the renderer.
+ */
+
+export type InlineNode =
+  | { kind: "text"; text: string }
+  | { kind: "code"; text: string }
+  | { kind: "strong"; children: InlineNode[] }
+  | { kind: "em"; children: InlineNode[] };
+
+type Token =
+  | { t: "text"; s: string }
+  | { t: "code"; s: string }
+  | { t: "delim"; ch: "*" | "_"; count: number; canOpen: boolean; canClose: boolean }
+  | { t: "node"; node: InlineNode };
+
+const PUNCT_RE = /[!-/:-@[-`{-~]/;
+
+function isWs(ch: string): boolean {
+  return ch === "" || /\s/.test(ch);
+}
+
+function isPunct(ch: string): boolean {
+  return ch !== "" && PUNCT_RE.test(ch);
+}
+
+function scan(source: string): Token[] {
+  const tokens: Token[] = [];
+  let text = "";
+  const flushText = () => {
+    if (text) {
+      tokens.push({ t: "text", s: text });
+      text = "";
+    }
+  };
+  let i = 0;
+  const n = source.length;
+  while (i < n) {
+    const ch = source[i] ?? "";
+    if (ch === "\\" && i + 1 < n && isPunct(source[i + 1] ?? "")) {
+      text += source[i + 1] ?? "";
+      i += 2;
+      continue;
+    }
+    if (ch === "\n") {
+      text += " "; // soft break renders as a space
+      i += 1;
+      continue;
+    }
+    if (ch === "`") {
+      let runLen = 1;
+      while (source[i + runLen] === "`") runLen += 1;
+      // Closer must be a backtick run of EXACTLY the same length.
+      let j = i + runLen;
+      let close = -1;
+      while (j < n) {
+        if (source[j] === "`") {
+          let closeLen = 1;
+          while (source[j + closeLen] === "`") closeLen += 1;
+          if (closeLen === runLen) {
+            close = j;
+            break;
+          }
+          j += closeLen;
+        } else {
+          j += 1;
+        }
+      }
+      if (close === -1) {
+        text += source.slice(i, i + runLen); // unclosed run stays literal
+        i += runLen;
+        continue;
+      }
+      flushText();
+      let content = source.slice(i + runLen, close).replace(/\n/g, " ");
+      if (
+        content.length >= 2 &&
+        content.startsWith(" ") &&
+        content.endsWith(" ") &&
+        content.trim() !== ""
+      ) {
+        content = content.slice(1, -1); // exactly one space of padding stripped
+      }
+      tokens.push({ t: "code", s: content });
+      i = close + runLen;
+      continue;
+    }
+    if (ch === "*" || ch === "_") {
+      let count = 1;
+      while (source[i + count] === ch) count += 1;
+      const prev = i > 0 ? source[i - 1] ?? "" : "";
+      const next = i + count < n ? source[i + count] ?? "" : "";
+      const leftFlanking =
+        !isWs(next) && (!isPunct(next) || isWs(prev) || isPunct(prev));
+      const rightFlanking =
+        !isWs(prev) && (!isPunct(prev) || isWs(next) || isPunct(next));
+      let canOpen = leftFlanking;
+      let canClose = rightFlanking;
+      if (ch === "_") {
+        // Intraword underscores never emphasize: snake_case stays literal.
+        canOpen = leftFlanking && (!rightFlanking || isPunct(prev));
+        canClose = rightFlanking && (!leftFlanking || isPunct(next));
+      }
+      flushText();
+      tokens.push({ t: "delim", ch, count, canOpen, canClose });
+      i += count;
+      continue;
+    }
+    text += ch;
+    i += 1;
+  }
+  flushText();
+  return tokens;
+}
+
+function tokenToNodes(token: Token): InlineNode[] {
+  switch (token.t) {
+    case "text":
+      return [{ kind: "text", text: token.s }];
+    case "code":
+      return [{ kind: "code", text: token.s }];
+    case "node":
+      return [token.node];
+    case "delim":
+      return token.count > 0
+        ? [{ kind: "text", text: token.ch.repeat(token.count) }]
+        : [];
+  }
+}
+
+function resolveEmphasis(tokens: Token[]): InlineNode[] {
+  const work: Token[] = tokens.slice();
+  let closerIdx = 0;
+  while (closerIdx < work.length) {
+    const closer = work[closerIdx];
+    if (!closer || closer.t !== "delim" || !closer.canClose || closer.count === 0) {
+      closerIdx += 1;
+      continue;
+    }
+    // Nearest preceding opener of the same character.
+    let openerIdx = -1;
+    for (let k = closerIdx - 1; k >= 0; k -= 1) {
+      const candidate = work[k];
+      if (
+        candidate &&
+        candidate.t === "delim" &&
+        candidate.ch === closer.ch &&
+        candidate.canOpen &&
+        candidate.count > 0
+      ) {
+        openerIdx = k;
+        break;
+      }
+    }
+    if (openerIdx === -1) {
+      closerIdx += 1;
+      continue;
+    }
+    const opener = work[openerIdx] as Extract<Token, { t: "delim" }>;
+    const use = opener.count >= 2 && closer.count >= 2 ? 2 : 1;
+    const innerTokens = work.slice(openerIdx + 1, closerIdx);
+    const children = innerTokens.flatMap(tokenToNodes);
+    const node: InlineNode =
+      use === 2 ? { kind: "strong", children } : { kind: "em", children };
+    opener.count -= use;
+    closer.count -= use;
+    const replacement: Token[] = [];
+    if (opener.count > 0) replacement.push(opener);
+    replacement.push({ t: "node", node });
+    if (closer.count > 0) replacement.push(closer);
+    work.splice(openerIdx, closerIdx - openerIdx + 1, ...replacement);
+    closerIdx = openerIdx; // re-scan from the replacement site
+  }
+  return work.flatMap(tokenToNodes);
+}
+
+/** Merge adjacent text nodes so the tree (and the DOM) is canonical. */
+function mergeText(nodes: InlineNode[]): InlineNode[] {
+  const out: InlineNode[] = [];
+  for (const node of nodes) {
+    const last = out[out.length - 1];
+    if (node.kind === "text" && last && last.kind === "text") {
+      out[out.length - 1] = { kind: "text", text: last.text + node.text };
+    } else if (node.kind === "strong" || node.kind === "em") {
+      out.push({ kind: node.kind, children: mergeText(node.children) });
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+export function parseInline(source: string): InlineNode[] {
+  return mergeText(resolveEmphasis(scan(source)));
+}

@@ -1,0 +1,479 @@
+/* One hand-written dark stylesheet. AA contrast on #16181d: body text
+   #e8eaf0 (~13:1), muted #a8b0c0 (~7:1), accent text #7fb5ff on dark fills
+   (v2 lesson: a dedicated brighter accent for text, separate from the
+   button-fill accent). */
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #16181d;
+  --bg-raised: #1e2128;
+  --bg-inset: #121419;
+  --border: #2c313c;
+  --text: #e8eaf0;
+  --text-muted: #a8b0c0;
+  --accent: #2f6fd0;
+  --accent-hover: #3a7ee6;
+  --accent-text: #7fb5ff;
+  --danger: #e05a5a;
+  --danger-text: #ff9d9d;
+  --ok-text: #7fd89a;
+  --focus: #9ecbff;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 16px;
+  min-height: 100vh;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+  flex: 1;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #4a5160;
+  flex: none;
+}
+
+.status-dot-active {
+  background: var(--ok-text);
+}
+
+.icon-button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 15px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.status-line {
+  margin: 0;
+  color: var(--text-muted);
+  min-height: 1.4em;
+}
+
+/* ---------------------------------------------------------------- record */
+
+.record-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.record-button {
+  flex: 1;
+  padding: 14px;
+  font-size: 16px;
+  font-weight: 600;
+  color: #ffffff;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.record-button:hover {
+  background: var(--accent-hover);
+}
+
+.record-recording {
+  background: var(--danger);
+}
+
+.record-recording:hover {
+  background: #ec6b6b;
+}
+
+.hotkey-chip {
+  flex: none;
+  font-size: 12px;
+  color: var(--accent-text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  background: var(--bg-raised);
+}
+
+.hotkey-taken {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger-text);
+}
+
+.meter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.level-meter {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-inset);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.level-fill {
+  height: 100%;
+  background: var(--ok-text);
+  transition: width 80ms linear;
+}
+
+.timer {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------------- ask */
+
+.ask-form {
+  display: flex;
+  gap: 8px;
+}
+
+.ask-input {
+  flex: 1;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+}
+
+.ask-input::placeholder {
+  color: #7b8496;
+}
+
+.ask-input:disabled,
+.ask-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ask-button,
+.primary-button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ask-button:hover:not(:disabled),
+.primary-button:hover {
+  background: var(--accent-hover);
+}
+
+.style-chips {
+  display: flex;
+  gap: 6px;
+}
+
+.style-chip {
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.style-chip[aria-pressed="true"] {
+  color: var(--accent-text);
+  border-color: var(--accent-text);
+}
+
+/* ---------------------------------------------------------------- panels */
+
+.panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 84px;
+}
+
+.panel-answer {
+  flex: 1;
+  min-height: 150px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+
+.panel-title h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  flex: none;
+}
+
+.panel-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.tag {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.tag-live {
+  color: var(--danger-text);
+  border: 1px solid var(--danger);
+}
+
+.tag-generating {
+  color: var(--accent-text);
+  border: 1px solid var(--accent);
+}
+
+.latency-chip {
+  font-size: 11px;
+  color: var(--ok-text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.panel-body {
+  padding: 8px 12px 12px;
+  overflow-y: auto;
+}
+
+.transcript-body {
+  max-height: 110px;
+  white-space: pre-wrap;
+}
+
+.answer-body {
+  flex: 1;
+  max-height: 300px;
+}
+
+.placeholder {
+  color: #7b8496;
+}
+
+.answer-body p,
+.answer-body ul,
+.answer-body ol,
+.answer-body pre {
+  margin: 0 0 8px;
+}
+
+.answer-body h3,
+.answer-body h4,
+.answer-body h5,
+.answer-body h6 {
+  margin: 10px 0 6px;
+  font-size: 13px;
+}
+
+.answer-body pre {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  overflow-x: auto;
+}
+
+.answer-body code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  background: var(--bg-inset);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.answer-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.answer-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+/* ---------------------------------------------------------------- errors */
+
+.error-box {
+  background: rgba(224, 90, 90, 0.12);
+  border: 1px solid var(--danger);
+  color: var(--danger-text);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+/* --------------------------------------------------------------- history */
+
+.history-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-spacer {
+  flex: 1;
+}
+
+.history-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mini-button {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.mini-button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.mini-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* -------------------------------------------------------------- settings */
+
+.settings .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings .field > span:first-child {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.settings input[type="text"],
+.settings input[type="password"],
+.settings select,
+.settings textarea {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.settings textarea {
+  resize: vertical;
+}
+
+.field-check {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.field-help {
+  font-size: 11px;
+  color: #7b8496;
+}
+
+.settings-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.saved-note {
+  color: var(--ok-text);
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

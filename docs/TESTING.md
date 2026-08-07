@@ -1,0 +1,639 @@
+# TESTING.md — every test, what it verifies, and why it exists
+
+This document is how future changes get judged. One bullet per test: what it
+verifies, and the failure mode it guards against. No test anywhere in either
+suite touches the network, a live provider, or an audio device — the core is
+exercised through Protocol-typed fakes at the wire level (scripted SSE bytes
+via `httpx.MockTransport`, a scripted WebSocket server on loopback), and the
+frontend through the real components with a mocked command/event bridge.
+
+Run them:
+
+```
+.venv\Scripts\python -m pytest tests -q        # core (217 tests)
+cd frontend && npm test                        # frontend (82 tests)
+```
+
+---
+
+## Core (pytest)
+
+### tests/test_frames.py — Deepgram frame parsing (hostile input)
+
+- **test_interim_and_final** — the two normal Results shapes parse to
+  segments; the base case everything else builds on.
+- **test_is_final_must_be_literally_true** — `1`, `"true"`, `[1]`, `1.0`
+  parse as *interim*. Why: a truthy imposter would commit interim text into
+  the transcript prefix, silently corrupting the question the answer is
+  grounded in.
+- **test_non_string_transcript_ignored** — non-string transcripts drop the
+  frame. Why: `str(None)` in the transcript would ground the answer in
+  garbage.
+- **test_missing_or_null_channel_ignored** — missing/null/wrong-typed
+  `channel` drops the frame instead of raising `TypeError` mid-recording.
+- **test_empty_alternatives_ignored** — `alternatives: []` (and non-dict
+  entries) drop the frame; indexing `[0]` blindly would crash the reader.
+- **test_malformed_json_ignored_never_crash** — garbage frames are ignored;
+  one weird frame must not kill a recording.
+- **test_pathologically_nested_json_ignored** — 50k-deep nesting hits
+  RecursionError inside `json.loads`; we swallow it. Why: a hostile/buggy
+  stream must not take down the reader task.
+- **test_non_dict_payloads_ignored** — valid JSON that isn't an object
+  (`[]`, `3`, `null`) is ignored, not attribute-errored.
+- **test_other_frame_types_ignored** — Metadata / UtteranceEnd /
+  SpeechStarted are ignored per spec.
+- **test_v1_listen_shape / test_newer_code_description_shape** — both error
+  frame shapes in the wild ({description,message,variant} and
+  {code,description}) surface their detail. Why: the surfaced `stt_error`
+  quotes whatever Deepgram said; losing the detail sends the user debugging
+  blind.
+- **test_error_with_no_detail** — an Error frame with no fields still
+  produces "unknown error" detail rather than crashing on a missing key.
+- **TestAccumulator.test_committed_prefix_plus_interim** — full transcript =
+  committed finals + latest interim, appended incrementally (O(1) per
+  message, not a re-join of the recording).
+- **test_empty_final_clears_interim_but_commits_nothing** — an empty final
+  supersedes stale interim text; committing "" would inject double spaces.
+- **test_whitespace_final_ignored** — whitespace-only finals don't pollute
+  the committed prefix.
+- **test_final_supersedes_interim** — a final replaces the interim that
+  preceded it (Deepgram re-sends the text, corrected).
+
+### tests/test_sse.py — SSE parser under hostile chunking
+
+- **test_single_event_lf / _crlf / _cr_only** — all three SSE line endings
+  produce the same event.
+- **test_multiple_events** — events dispatch on blank lines, in order.
+- **test_comment_lines_skipped** — `: keep-alive` lines are dropped (Groq
+  sends them).
+- **test_non_data_fields_ignored** — `event:`/`id:`/`retry:` fields don't
+  become data.
+- **test_multi_line_data_joined_with_newline** — multi-`data:` events join
+  with `\n` per the SSE spec.
+- **test_only_one_leading_space_stripped** — exactly one space after the
+  colon is stripped; stripping more would corrupt deltas that begin with
+  spaces (which streaming answers routinely do).
+- **test_final_unterminated_data_line_flushed** — a stream that dies without
+  a trailing newline still yields its last `data:` line. Why: a truncated
+  stream otherwise silently loses the answer's last words.
+- **test_unterminated_event_without_blank_line_flushed** — same, for a
+  terminated line missing its blank-line dispatch.
+- **test_empty_stream** — zero bytes parse to zero events, no crash.
+- **test_every_cut_point_matches_batch** — THE invariant: for a corpus of 8
+  hostile documents (CRLF, comments, [DONE], multi-byte UTF-8, Japanese
+  text), splitting the byte stream at EVERY offset yields identical events
+  to parsing it whole. Why: real chunk boundaries are arbitrary; any
+  boundary-dependent behavior is a latent data-corruption bug.
+- **test_three_way_cuts_on_crlf_heavy_doc** — three-fragment splits stress
+  carry-over state (line buffer + pending CR) across two boundaries.
+- **test_byte_at_a_time** — the pathological minimum chunk size, including a
+  € sign split mid-encoding; exercises the incremental UTF-8 decoder.
+- **test_split_between_cr_and_lf_no_phantom_blank_line** — the CR|LF split
+  must not fabricate an empty line, which would dispatch the event twice.
+
+### tests/test_prompt.py — prompt building (byte-stable product behavior)
+
+- **test_bare_prompt_is_role_only** — no resume/JD → no grounding sentence;
+  the grounding line must not appear without profile content to ground in.
+- **test_resume_section_appended_with_grounding /
+  test_jd_section_appended** — exact section headers, grounding appended
+  when either section exists.
+- **test_edge_trim_only_interior_formatting_survives** — resume trimmed at
+  the edges only; interior formatting belongs to the user.
+- **test_user_message_wrapper_verbatim** — the exact wrapper string; this is
+  product behavior, not prose.
+- **test_three_styles / test_unknown_style_falls_back_to_balanced** — the
+  three verbatim style policies; corrupt style values degrade to balanced
+  instead of crashing or emitting an empty policy.
+- **test_byte_stable_across_calls** — identical inputs → byte-identical
+  prompts. Why: Anthropic caching is a byte-prefix match; one drifting byte
+  silently zeroes the cache hit rate.
+- **test_style_flip_never_touches_cached_prefix** — all three styles share
+  one cached prefix. Why: the style policy sits AFTER the cache breakpoint
+  so flipping styles is latency-free.
+- **test_transcript_lives_outside_the_system_prompt** — transcripts vary per
+  question; if they leaked into the prefix, no two calls would ever share a
+  cache entry.
+
+### tests/test_bounds.py — window-geometry sanitizer
+
+- **TestCorruption (5 tests)** — non-dict, missing field, wrong-typed field,
+  bool-as-number, NaN/inf: each drops the bounds AS A UNIT. Why: restoring
+  half-corrupt geometry can place the window at (NaN, NaN) — invisible and
+  unrecoverable; `True` is an int subclass in Python and must not pass as a
+  coordinate.
+- **test_size_clamps_up_to_minimum** — persisted sizes below the window
+  minimum clamp up; a 10×10 restore is an unusable window.
+- **test_floats_rounded_to_integers** — Win32 wants ints.
+- **test_fully_on_screen_keeps_position** — the happy path.
+- **test_offscreen_drops_position_keeps_size** — position drops (OS
+  centers), size survives.
+- **test_39px_visible_is_not_enough_40_is** — the exact 40 px boundary on
+  the visibility rule.
+- **test_both_axes_must_overlap** — 40 px on one axis alone is not visible;
+  a window above the work area with full horizontal overlap is still lost.
+- **test_negative_coordinates_valid_on_left_monitor** — displays left of
+  primary have negative x; rejecting negatives would recenter valid setups.
+- **test_unplugged_monitor_recenters** — same coordinates, monitor gone →
+  position dropped. The unplug-a-monitor scenario from the QA script.
+- **test_visibility_judged_at_clamped_size** — visibility uses the CLAMPED
+  size; judging the stored 10×10 would wrongly drop a recoverable position.
+- **test_no_displays_drops_position** — no display info → let the OS place
+  the window.
+
+### tests/test_secrets.py — DPAPI secret semantics
+
+- **test_roundtrip_encrypted** — enc: roundtrip through the keystore.
+- **test_keystore_unavailable_falls_back_to_marked_plain /
+  test_failing_keystore_falls_back_to_marked_plain** — no keystore (or a
+  throwing one) → `plain:` MARKED fallback, honestly labeled, still
+  functional.
+- **test_key_material_never_stored_raw** — the raw key never appears in the
+  stored string.
+- **test_unicode_keys_survive** — UTF-8 roundtrip.
+- **test_decodes_by_stored_prefix_not_keystore_availability** — a `plain:`
+  value decodes even when a keystore exists now. Why: decoding by current
+  availability instead of stored prefix breaks keys saved before DPAPI came
+  back.
+- **test_enc_value_without_keystore_reads_as_unset** — fail closed.
+- **test_undecryptable_reads_as_unset** — a blob from another machine reads
+  as unset, never as garbage handed to a provider.
+- **test_unknown_prefix_reads_as_unset** — future formats (or raw keys
+  pasted into the file) never reach a provider as-is.
+- **test_invalid_base64_reads_as_unset / test_non_string_reads_as_unset** —
+  corrupt values fail closed.
+
+### tests/test_settings.py — settings store
+
+- **test_missing_file_loads_defaults** — first run.
+- **test_unparseable_file_loads_defaults_never_crashes /
+  test_non_object_file_loads_defaults** — corrupt file = defaults, not a
+  crash at boot.
+- **test_per_field_fallback_one_corrupt_value_costs_nothing_else** — THE
+  fallback rule: four corrupt fields fall back individually while the
+  resume, style, and hotkey survive. Why: whole-file fallback silently
+  destroys the user's resume and keys over one bad byte.
+- **test_oversize_profile_field_falls_back** — the 200k cap on load.
+- **test_empty_hotkey_means_disabled_not_default** — `""` must NOT spring
+  back to Ctrl+Shift+Space; the user chose "no shortcut".
+- **test_corrupt_secrets_dict_falls_back_alone** — secrets corruption
+  doesn't take the resume with it.
+- **test_patch_returns_fresh_view** — the UI re-renders from the returned
+  view; the core is the source of truth.
+- **test_invalid_style_rejected / test_invalid_provider_rejected /
+  test_oversize_resume_rejected** — patch validation raises (→ error Result
+  envelope), never partially applies.
+- **test_resume_stored_verbatim_not_trimmed** — profile formatting belongs
+  to the user.
+- **test_hotkey_trimmed_on_save** — raw spaces would make shortcut
+  registration throw; whitespace-only → "" (disabled).
+- **test_unknown_patch_fields_ignored** — forward compatibility.
+- **test_view_exposes_booleans_never_key_material** — the frontend NEVER
+  receives key material; only has\*Key booleans. Serializing the whole view
+  proves it.
+- **test_has_key_fields_generated_from_registry** — a new provider gets its
+  boolean for free.
+- **test_omitted_key_field_leaves_key_untouched** — saving the settings form
+  without typing a key must not clear the stored key.
+- **test_empty_or_whitespace_key_clears** — the documented way to remove a
+  key.
+- **test_key_trimmed_before_store** — pasted keys carry whitespace.
+- **test_keys_encrypted_on_disk** — the raw key never appears in
+  settings.json.
+- **test_undecryptable_secret_reads_as_unset_in_view** — hasDeepgramKey is
+  false for a foreign blob; the UI must nudge for a new key, not pretend one
+  exists.
+- **test_write_goes_through_tmp_and_replace** — atomic write; no stray tmp
+  file left behind.
+- **test_failed_write_leaves_memory_matching_disk** — a failed `os.replace`
+  leaves the in-memory cache at the last committed state. Why: memory-ahead-
+  of-disk means the next successful save silently commits the failed patch.
+- **test_window_bounds_save_never_raises** — geometry saves during shutdown
+  must never throw.
+- **test_window_bounds_roundtrip** — bounds persist across a reload.
+
+### tests/test_retry.py — the retry policy matrix
+
+- **test_connect_failure_before_any_delta_retries_once** — the ONE retryable
+  case: connection-level failure, zero deltas delivered.
+- **test_two_connect_failures_do_not_retry_twice** — "exactly once" is a
+  hard cap; unbounded retry burns the latency budget.
+- **test_http_status_never_retried** — the server heard us and said no; an
+  instant identical retry cannot succeed and delays the real error.
+- **test_never_after_a_delta** — the UI has painted; a second attempt would
+  concatenate two answers. The painted partial stays.
+- **test_never_after_abort** — CancelledError propagates as control flow;
+  retrying cancelled work resurrects a session the user killed.
+- **test_retried_request_is_the_same_object** — byte-identical retry by
+  construction: `build_request` ran once; the immutable request is reused.
+
+### tests/test_providers.py — provider conformance + error matrices
+
+TestProviderConformance runs against BOTH shipped providers (parameterized);
+it is the suite a future provider clones (README "How to add an answer
+provider"):
+
+- **test_identity** — id/display_name/origin present; origin has no trailing
+  slash (the warmer appends `/v1/models`).
+- **test_build_request_is_deterministic** — two builds are byte-identical
+  (prompt caching + honest retry both depend on this).
+- **test_request_carries_the_key_and_json_content_type** — auth actually
+  reaches the wire.
+- **test_stream_yields_expected_deltas** — scripted SSE bytes stream out as
+  the expected concatenation.
+- **test_stream_survives_hostile_chunking** — chunk sizes 1/2/3/7 over
+  multi-byte UTF-8 content; providers parse from bytes, so split characters
+  must survive.
+- **test_non_200_raises_status_failure** — status + body snippet captured
+  for classification.
+- **test_200_with_empty_body_raises_not_crashes** — Groq has returned 200
+  with nothing; that must be an error Result, not a hang or crash.
+- **test_connection_failure_is_connect_kind** — the only retryable kind.
+- **test_mid_stream_drop_is_stream_drop_kind** — deltas before the drop
+  still made it out (the UI keeps the partial); the drop is not "connect"
+  (which would wrongly retry after paint).
+- **test_abort_classified_first_never_a_scary_http_error** — CancelledError
+  → `aborted` BEFORE any HTTP inspection.
+- **test_401_maps_to_llm_auth / test_429_maps_to_rate_limit** — the closed
+  code set with the status quoted.
+- **test_connect_maps_to_llm_http_with_actionable_message** — "check your
+  internet", not a stack trace.
+- **test_unknown_exception_maps_to_internal** — no raw exception text
+  reaches the UI.
+- **test_only_connect_is_retryable** — the full retryable/not matrix.
+
+TestAnthropicSpecifics:
+
+- **test_body_shape_two_system_blocks_cache_breakpoint_on_first** — model
+  pinned, max_tokens 1024, TWO system blocks, cache_control on the first
+  only. Why: cache_control on the style block would invalidate the cache on
+  every style flip.
+- **test_headers** — x-api-key + anthropic-version pinned.
+- **test_multiple_content_blocks_joined_with_nothing** — deltas across
+  content blocks concatenate with NOTHING between; a joiner would corrupt
+  the answer relative to what streamed.
+- **test_403_is_llm_auth / test_529_overloaded /
+  test_other_status_includes_snippet** — the Anthropic status matrix.
+
+TestGroqSpecifics:
+
+- **test_body_shape_single_system_string_and_reasoning_knobs** — ONE joined
+  system string; `reasoning_effort: low` + `include_reasoning: false`
+  (reasoning is the enemy of time-to-first-word); `reasoning_format` is
+  NEVER sent (Qwen-family knob — Groq 400s on it for this model family).
+- **test_bearer_auth** — OpenAI-style auth header.
+- **test_done_sentinel_skipped_bytes_after_still_count** — `[DONE]` is a
+  sentinel to skip, not a terminator; treating it as EOF drops any bytes
+  that follow in the same chunk.
+- **test_truncated_stream_flushes_last_words** — the SSE flush rule
+  end-to-end through a provider.
+- **test_404_points_at_the_pinned_model_constant** — Groq retires models on
+  short notice; the message tells the user exactly which constant to update.
+- **test_403_reports_actual_status** — a 403 labelled 401 sends the user
+  debugging the wrong thing.
+- **test_5xx_unavailable / test_stream_drop_message** — remaining matrix
+  rows.
+- **test_helpers_are_importable_template_pieces** — `extract_openai_delta` /
+  `is_done_sentinel` stay importable; the Groq module is the template for
+  future OpenAI-compatible providers.
+
+### tests/test_warm.py — pre-warm
+
+- **test_warms_the_models_endpoint** — GET `<origin>/v1/models`, body read
+  to completion (that's what returns the connection to the pool).
+- **test_throttled_to_one_per_origin_per_2s** — the throttle boundary at
+  exactly 2.0 s, driven by an injected clock.
+- **test_throttle_is_per_origin** — switching providers must not starve the
+  new origin's warm.
+- **test_failed_warm_never_raises** — a failed warm costs nothing; a raising
+  warm would kill the session task that fired it.
+
+### tests/test_machine.py — the §5 session-machine invariants
+
+TestHappyPath:
+
+- **test_record_stop_answer** — the whole pipeline through fakes: frames
+  routed, partials emitted, stop taken, metrics sane, deltas in order, done
+  carries the full answer, audio stopped.
+- **test_audio_level_events_flow_while_recording** — rms reaches the sink
+  tagged with the session id.
+- **test_stop_warms_the_provider_origin** — the stop-press warm exists (it
+  overlaps the TLS handshake with the finalize).
+
+TestKeyChecks:
+
+- **test_missing_deepgram_key / test_missing_llm_key_on_start /
+  test_missing_llm_key_on_ask** — key checks fail the COMMAND (error
+  Result), before any session is created or superseded.
+
+TestSupersession (rule 1):
+
+- **test_new_start_aborts_active_and_drops_its_events** — the superseded
+  session's stream is aborted; its late update AND its abort-caused socket
+  death produce zero events.
+- **test_ask_over_recording_supersedes_silently** — the ask-over-recording
+  race: recording dies silently, typed question answers.
+- **test_ask_over_streaming_answer_supersedes** — asking over a streaming
+  answer; the old session's done is dropped by id (only the new done
+  arrives).
+
+TestLatestStartWins (rule 2):
+
+- **test_second_start_during_first_connect_wins** — double-record during
+  connect: the loser resolves late, tears down, never installs itself;
+  frames route to the winner only.
+- **test_connect_failure_after_losing_is_silent** — the loser's connect
+  FAILURE is also silent; reporting it would flash a scary error over a
+  healthy new recording.
+
+TestStopContract (rule 3):
+
+- **test_unknown_id_not_taken / test_stop_during_connect_not_taken /
+  test_second_stop_while_first_runs_not_taken /
+  test_stop_after_completion_not_taken /
+  test_stop_after_error_teardown_not_taken** — every "not taken" case
+  returns an error Result. Why: every other outcome arrives as an event; a
+  silently ignored stop leaves the UI in "Finalizing…" forever.
+- **test_not_taken_emits_no_events** — not-taken is a return value, never an
+  event.
+
+TestAudioRouting (rule 4):
+
+- **test_frames_after_stop_requested_are_dropped** — an in-flight frame
+  arriving after stop is dropped; sending it would race the CloseStream
+  flush.
+- **test_frames_for_stale_session_dropped** — a stale callback delivers to
+  no one.
+
+TestSttErrorPolicy (rules 5+6):
+
+- **test_mid_recording_death_one_error_and_teardown** — ONE `stt_error`
+  (second report suppressed), session torn down. Why: a silently truncated
+  transcript answers the wrong question.
+- **test_late_death_after_finalize_never_kills_streaming_answer** — the
+  second half of rule 5: once the transcript is final, the STT stream's job
+  is done; its late death must not kill an answer mid-stream.
+- **test_connect_failure_surfaces_stt_connect** — connect failure surfaces
+  through the event channel with the right code.
+
+TestEmptyTranscript (rule 7):
+
+- **test_whitespace_transcript_is_no_speech_never_an_llm_call** —
+  `no_speech` with the actionable message, and the provider was NEVER
+  called (`stream_calls == 0`).
+
+TestAskPath (rule 8):
+
+- **test_garbage_input_never_kills_a_live_session** — empty and >8000-char
+  asks error WITHOUT superseding; the recording stays stoppable.
+- **test_ask_resolves_id_before_any_event** — zero events before the command
+  resolved.
+- **test_ask_event_shape_and_metrics** — the trimmed question arrives as one
+  `stt:partial {isFinal: true}` (both paths share one event shape), then
+  done with `sttFinalizeMs` EXACTLY 0 (no STT stage — billing one would be
+  a lie).
+- **test_8000_chars_exactly_is_accepted** — boundary of the validation.
+
+TestTimeoutInterplay (rule 9):
+
+- **test_first_token_timeout** — a provider that never yields →
+  `llm_first_token_timeout`, zero deltas painted, no done.
+- **test_total_timeout_after_deltas** — first delta disarms the first-token
+  timer; the total timer still fires; the painted delta stays; nothing
+  paints after the timeout.
+- **test_first_delta_disarms_first_token_timer** — slow-but-flowing deltas
+  complete without any timeout firing.
+
+TestProviderFailures:
+
+- **test_status_error_surfaces_classified** — provider classification flows
+  through to the session:error event.
+- **test_connect_failure_retried_once_then_succeeds** — the retry policy
+  wired into the machine (2 stream calls, 1 done, 0 errors).
+
+TestCancel (rule 10):
+
+- **test_cancel_is_silent_and_releases_slot** — no done, no error, event
+  stream frozen; the slot is free for the next session (rule 11).
+- **test_cancel_invalid_id_does_nothing** — never an error; the live session
+  is untouched.
+- **test_cancel_during_stop_is_silent** — the cancel-during-stop race: the
+  finalize is abandoned with no events.
+
+TestSlotRelease (rule 11):
+
+- **test_after_error_next_session_starts_clean /
+  test_after_done_next_session_starts_clean** — whatever the outcome, the
+  slot released exactly once; the next session never supersedes a ghost.
+
+TestRecordCap:
+
+- **test_cap_auto_stops_and_answers_normally** — at the cap the machine
+  emits `session:autostopped` and answers normally (the UI uses the event
+  for its "Reached the 120s limit" status).
+- **test_manual_stop_cancels_the_cap** — no phantom autostop after a normal
+  stop.
+
+### tests/test_deepgram_client.py — DeepgramStream over loopback WebSockets
+
+- **test_interim_then_final_updates_and_closestream_flush** — subprotocol
+  auth asserted server-side; interim/final callbacks; CloseStream triggers
+  the server flush and finalize returns the full transcript including the
+  held-back tail.
+- **test_preopen_frames_buffered_and_flushed_in_order** — frames sent before
+  the socket opened arrive first and in order; losing them clips the start
+  of the question.
+- **test_malformed_frames_ignored_never_crash** — hostile frames interleaved
+  with real ones; the real transcript survives.
+- **test_close_before_any_results_is_a_connect_failure** — Deepgram rejects
+  bad keys by CLOSING (1008, DATA-xxxx reason, no error frame); surfaced as
+  `stt_connect` quoting code+reason with the "check the API key" message.
+- **test_mid_recording_death_after_results_is_stt_error** — a 1011 close
+  after transcription started is a mid-recording death, not a connect
+  failure.
+- **test_error_frame_reported_once_with_detail** — Error frames surface once
+  with their detail quoted.
+- **test_connect_refused_raises_stt_connect** — nothing listening → the
+  connect coroutine raises the structured error.
+- **test_abort_suppresses_the_death_it_causes** — abort causes a close; that
+  close is never reported (rule 1's "abort must not be reported as error").
+- **test_finalize_is_idempotent_second_call_joins** — two concurrent
+  finalize calls send ONE CloseStream and return the same transcript.
+- **test_never_opened_stream_finalizes_immediately** — no socket → return
+  what we have now, don't burn the 5 s cap.
+- **test_dead_stream_finalizes_immediately_with_what_it_has** — an
+  already-dead stream finalizes instantly with the partial transcript.
+- **test_unresponsive_server_finalize_returns_at_cap** — a server that
+  ignores CloseStream: finalize returns at the cap with the transcript so
+  far; better a slightly clipped tail than a hung stop.
+- **test_keepalive_sent_while_open_and_stopped_after_close_request** —
+  KeepAlives flow during silence (Deepgram kills idle sockets ~10 s), and
+  NOTHING follows CloseStream: a late KeepAlive errors on the CLOSING
+  socket and fabricates a "lost connection" during a stop that is
+  succeeding.
+
+### tests/test_downsample.py — audio math
+
+- **test_interleaved_stereo_unpacks / test_stereo_to_mono_averages /
+  test_float_to_i16_clips** — the conversion chain, including clipping
+  (overflow wraps horribly in int16).
+- **test_48k_to_16k_reduces_by_three / test_16k_passthrough /
+  test_empty_input** — resampling ratios and edge cases.
+- **test_sine_survives_resampling** — a 440 Hz tone keeps its energy through
+  the linear-interp resample (a wrong stride silently produces near-silence,
+  which Deepgram transcribes as nothing).
+- **test_device_chunk_to_16k_mono_i16 /
+  test_frame_samples_constant_matches_spec** — one device chunk becomes the
+  spec'd 16 kHz mono i16 stream; 2048 samples ≈ 128 ms.
+
+### tests/test_hotkey.py — accelerator parsing (pure)
+
+- **test_default_hotkey / test_case_and_spacing_tolerant /
+  test_letter_and_digit_keys / test_function_keys / test_win_modifier** —
+  the accelerator grammar maps to the right Win32 modifiers + VK codes.
+- **test_invalid_forms** — empty, modifier-only, unknown keys, two keys,
+  F25: all rejected (None) so registration reports failure honestly instead
+  of registering the wrong key.
+
+---
+
+## Frontend (Vitest + Testing Library)
+
+### src/__tests__/markdown-blocks.test.ts — block parser
+
+- **headings demote (#→h3, cap h6)** — the page owns h1/h2; model output
+  must not out-rank the app's own hierarchy.
+- **trailing closing hashes stripped** — `# Title ##` renders "Title".
+- **paragraph joining/splitting** — soft-wrapped lines join; blank lines
+  split.
+- **fence info string dropped, content verbatim** — code content renders
+  as-is (including HTML-looking text) with no interpretation.
+- **tilde fences + longer closers / wrong closer doesn't close** — fence
+  matching rules (char + length).
+- **unterminated fence at EOF = open block** — while streaming, a fence that
+  hasn't closed YET must render as code, not as a paragraph that reflows
+  when the closer arrives.
+- **hr forms + hr-vs-list precedence** — `- - -` is a rule, not a list.
+- **bullet + ordered lists (n. and n))** with start numbers — `3.` starts at
+  3.
+- **lazy continuation** — wrapped item text belongs to the item.
+- **loose lists: blank line ends the list only if no item follows** — the
+  spec'd rule verbatim.
+
+### src/__tests__/markdown-render.test.tsx — rendering, XSS, streaming
+
+- **bold/italic/nesting/underscore emphasis** — inline basics through the
+  real component.
+- **snake_case must not italicize** — the flanking-rule regression the spec
+  calls out by name.
+- **intraword asterisk allowed** — CommonMark behavior, documents intent.
+- **unmatched delimiters stay literal** — `2 * 3` must not eat asterisks.
+- **inline code exact-length closers, one-space padding strip, no emphasis
+  inside code, backslash escapes** — inline code hazards.
+- **links deliberately NOT parsed (+ javascript: stays text)** — there is no
+  `<a>`, no href, nothing to sanitize. THE anti-XSS design decision.
+- **XSS suite (8 payloads)** — `<script>`, `<img onerror>`, fence-escape
+  `</pre><script>`, attribute-injection quotes, `<svg onload>`, `<iframe>`:
+  each renders as literal text, zero live elements, and NO element carries
+  any attribute beyond `<ol start>`. Model output is untrusted; this suite
+  is the proof.
+- **raw payload stays visible** — sanitizing by deletion would hide what the
+  model actually said; we render it as text instead.
+- **every cut point renders identically to a batch render** — the streaming
+  invariant over a 6-document corpus: stream-then-finish DOM ===
+  render-once DOM at every prefix length.
+- **rendering any prefix never throws** — half-typed markdown (open fences,
+  dangling emphasis) is the NORMAL streaming case.
+- **completed blocks keep their DOM nodes** — node identity across updates
+  (no flicker, no lost selection while streaming).
+- **unchanged source is a no-op** — re-render with identical text keeps DOM
+  identity.
+
+### src/__tests__/format.test.ts — display formatting
+
+- **mm:ss formatting + negative clamp** — the recording timer.
+- **latency chip one-decimal seconds** — "0.9s to first word" is THE
+  product number; its rounding is product behavior.
+- **latency title breakdown** — the hover explains all three metrics.
+- **hotkey display formatting** — chip shows "Ctrl+Shift+Space" regardless
+  of stored casing.
+
+### src/__tests__/app-flows.test.tsx — main flows through the mocked bridge
+
+- **full record walk (idle→starting→recording→finalizing→answering→done)** —
+  status lines per state, live tag, markdown-rendered answer, latency chip,
+  transcript panel.
+- **level meter + timer only while recording** — recording chrome scoped to
+  the recording state.
+- **events before the start promise resolved are replayed on adopt** — the
+  bridge resolution race: the core may emit for s1 before the JS promise
+  resolves; buffering-then-replay prevents losing the first partial.
+- **stale events change nothing, ever** — wrong-id partials and errors are
+  dropped (supersession safety on the UI side).
+- **not-taken stop recovers to idle** — the stop return contract in action;
+  without it the UI hangs in "Finalizing…" forever.
+- **start failure shows the actionable error** — no_stt_key surfaces in the
+  role=alert box.
+- **120s cap event flips the status** — "Reached the 120s limit — answering
+  now".
+- **session:error → alert + idle + partial answer kept** — an error during a
+  streaming answer must not erase what already painted (looks like data
+  loss).
+- **aborted error code never shown** — `aborted` means the user did it;
+  showing it as an error would blame them for their own click.
+- **ask: trimmed submit, input cleared on success** — and the answer flows
+  through the same panels.
+- **ask failure keeps the input** — so the user can retry without retyping.
+- **empty/whitespace submits never reach the core** — validated at the edge.
+- **ask disabled during starting/recording/finalizing, enabled while
+  answering** — asking over a streaming answer supersedes it.
+
+### src/__tests__/app-history.test.tsx — history + regenerate
+
+- **hidden until 2+ entries** — the bar earns its space.
+- **prev/next navigation shows the viewed entry** — n/m label and content
+  switch together.
+- **only the last 6 entries kept** — oldest trimmed; entry 1 gone, entry 2
+  the oldest survivor.
+- **new recording jumps the view to the live entry** — you always watch the
+  question being answered now.
+- **clear wipes, announces "History cleared", moves focus to Record** — the
+  button focus lived on disappears; focus must land somewhere sensible.
+- **aborted attempt that captured nothing is discarded** — an empty husk
+  entry would pollute history.
+- **failed attempt that captured a question is retired** — the transcript is
+  user work; a half-streamed answer vanishing looks like data loss.
+- **regenerate re-asks the viewed question as a NEW entry** — the old answer
+  survives for comparison.
+- **regenerate hidden while recording / without a question** — visibility
+  rule.
+
+### src/__tests__/app-settings.test.tsx — settings, styles, hotkey, first-run
+
+- **gear opens settings and focuses the heading** — focus management on
+  view swap (there is no dialog; the view replaces the main view).
+- **provider select built from the registry** — options come from the
+  settings view's provider list, not hard-coded (a new provider appears for
+  free).
+- **key fields: password type, "saved — type to replace" placeholder, always
+  empty value** — write-only keys across the UI boundary.
+- **save sends ONLY the key fields actually typed into** — untouched
+  providers' keys survive every unrelated save.
+- **save without touching keys omits `keys` entirely** — omission ≠ clear.
+- **Escape closes and returns focus to the gear** — keyboard path.
+- **save failures surface in the settings-local error box** — the main error
+  box is hidden behind this view.
+- **style chips: aria-pressed reflects the PERSISTED style** — the save's
+  return value wins over the clicked chip; optimistic UI here can lie about
+  what the next answer will use.
+- **persisted flip updates the pressed chip** — the happy path of the same
+  rule.
+- **hotkey chip + status mention when registered** — discoverability.
+- **taken notice when registration failed** — register honestly: a dead
+  shortcut with no notice is the worst outcome.
+- **hotkey:toggle does what Record does** — one behavior, two triggers.
+- **hotkey IGNORED while settings open** — the user may be typing the
+  hotkey itself into the hotkey field.
+- **first-run nudge for missing SELECTED-provider key; no nudge when only an
+  unselected provider's key is missing** — the nudge tracks what would
+  actually block a recording.

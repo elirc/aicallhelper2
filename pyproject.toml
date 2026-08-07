@@ -1,0 +1,43 @@
+[project]
+name = "ai-call-assistant"
+version = "3.0.0"
+description = "Push-to-record interview copilot for Windows (Python core + pywebview shell)"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "frontend", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# RUF001/002/003: this codebase intentionally uses em-dashes and ellipses in
+# user-facing strings; they are product copy, not typos.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["app_core", "app.py"]
+exclude = "(\\.venv|frontend|build|dist)"
+
+[[tool.mypy.overrides]]
+module = [
+    "pyaudiowpatch",
+    "pyaudiowpatch.*",
+    "global_hotkeys",
+    "global_hotkeys.*",
+    "webview",
+    "webview.*",
+    "win32crypt",
+    "win32event",
+    "win32api",
+    "win32gui",
+    "win32con",
+    "winerror",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
