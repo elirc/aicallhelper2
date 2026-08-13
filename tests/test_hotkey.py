@@ -115,3 +115,11 @@ class TestRegistrationStatus:
         finally:
             first.unregister()
         assert first.status == "disabled"
+
+    def test_f_key_parsing_rejects_non_ascii_numerals(self) -> None:
+        # str.isdigit() is True for 128 codepoints int() rejects, so "f²"
+        # raised ValueError out of a parser documented never to raise; and
+        # non-ASCII decimals like "f٢" would otherwise map to a real F-key.
+        for bad in ["f\u00b2", "ctrl+f\u00b2", "f\u2460", "f\u0662", "f\u1369"]:
+            assert parse_accelerator(bad) is None, bad
+        assert parse_accelerator("f2") is not None

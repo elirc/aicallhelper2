@@ -136,8 +136,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
 ## Testing
 
 ```
-.venv\Scripts\python -m pytest tests -q      # 288 core tests
-cd frontend && npm test                       # 146 frontend tests
+.venv\Scripts\python -m pytest tests -q      # 297 core tests
+cd frontend && npm test                       # 148 frontend tests
 .venv\Scripts\python -m ruff check app_core app.py tests
 .venv\Scripts\python -m mypy                  # strict, on the core
 cd frontend && npm run typecheck              # TS strict

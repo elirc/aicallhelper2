@@ -59,8 +59,11 @@ class TestRetryOnce:
 
     async def test_never_after_a_delta(self) -> None:
         # A second attempt would concatenate two answers in the UI.
+        # The failure kind must be RETRYABLE ("connect"), or the policy skips
+        # the retry via is_retryable and this test proves nothing about the
+        # got_delta guard — a mutation test caught exactly that.
         provider = FakeProvider()
-        provider.fail_after_first_delta = ProviderFailure("stream_drop")
+        provider.fail_after_first_delta = ProviderFailure("connect")
         deltas: list[str] = []
         request = provider.build_request(provider_prompt(), "key")
         with pytest.raises(ProviderFailure):

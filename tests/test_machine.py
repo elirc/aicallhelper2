@@ -619,3 +619,75 @@ class TestStopContractExtra:
             await h.machine.stop_session(sid)
         h.provider.post_delta_hang.set()
         await h.drain()
+
+
+class TestMutationSurvivors:
+    """Guards that a mutation test proved no assertion protected."""
+
+    async def test_a_stalled_ask_never_supersedes_a_later_command(
+        self, harness: Harness
+    ) -> None:
+        # The ticket check inside ask() was deletable with the whole suite
+        # still green: the existing ticket test only ever stalls
+        # start_session, so ask()'s own copy was never load-bearing.
+        h = harness
+        gate = threading.Event()
+        first = {"pending": True}
+        real_get = h.settings.get_secret
+
+        def stalling_get(secret_id: str) -> str | None:
+            if first["pending"]:
+                first["pending"] = False
+                gate.wait(timeout=5.0)
+            return real_get(secret_id)
+
+        h.settings.get_secret = stalling_get  # type: ignore[method-assign]
+        early = asyncio.get_running_loop().create_task(h.machine.ask("the early ask"))
+        await h.settle()
+        later_sid = await h.machine.ask("the question I actually want")
+        gate.set()
+        with pytest.raises(AppError) as info:
+            await early
+        assert info.value.code == "aborted"
+        await h.drain()
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [later_sid]
+
+    async def test_frames_arriving_between_stop_request_and_phase_flip_are_dropped(
+        self, harness: Harness
+    ) -> None:
+        # _begin_stop sets stop_requested and phase in one synchronous block,
+        # so no loop-driven test can separate them — but a real audio thread
+        # delivers frames into exactly that window. Drive the guard directly.
+        h = harness
+        sid = await start_and_connect(h)
+        session = h.machine._active
+        assert session is not None and session.id == sid
+        stt = h.stt.last
+        session.stop_requested = True  # phase deliberately still "recording"
+        h.machine._on_frame(session, b"late-frame", 0.5)
+        assert b"late-frame" not in stt.frames
+        session.stop_requested = False
+        await h.machine.stop_session(sid)
+        await h.drain()
+
+    async def test_a_failed_session_emits_nothing_but_its_error(
+        self, harness: Harness
+    ) -> None:
+        # The _emit guard is masked by sibling checks on every loop-driven
+        # path, so exercise it directly.
+        h = harness
+        sid = await start_and_connect(h)
+        session = h.machine._active
+        assert session is not None
+        session.errored = True
+        h.machine._emit(session, "llm:delta", {"delta": "must not paint"})
+        h.machine._emit(session, "stt:partial", {"text": "nope", "isFinal": True})
+        h.machine._emit(
+            session, "session:error", {"error": {"code": "stt_error", "message": "x"}}
+        )
+        for name, payload in h.sink.for_session(sid):
+            if name == "llm:delta":
+                assert payload.get("delta") != "must not paint"
+            if name == "stt:partial":
+                assert payload.get("text") != "nope"
+        assert h.sink.named("session:error"), "the error itself must still get out"

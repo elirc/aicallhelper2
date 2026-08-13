@@ -47,6 +47,8 @@ interface State {
   protectionFailed: boolean;
   seconds: number;
   capped: boolean;
+  /** A stop was refused; waiting to see whether an answer still arrives. */
+  stopStranded: boolean;
   done: boolean;
   settingsOpen: boolean;
   settings: SettingsView | null;
@@ -58,6 +60,9 @@ const MAX_HISTORY = 6;
 const AUDIBLE_RMS = 0.003;
 // Long enough that a natural pause in the question never trips it.
 const SILENCE_HINT_AFTER_S = 5;
+// Long enough for a finalize the 120 s cap already started (5 s STT cap
+// plus the answer's first token), short enough not to feel stuck.
+const STOP_RECOVERY_MS = 20_000;
 
 const initialState: State = {
   phase: "idle",
@@ -70,6 +75,7 @@ const initialState: State = {
   protectionFailed: false,
   seconds: 0,
   capped: false,
+  stopStranded: false,
   done: false,
   settingsOpen: false,
   settings: null,
@@ -84,6 +90,7 @@ type Action =
   | { type: "start-aborted" }
   | { type: "stop-accepted" }
   | { type: "stop-not-taken" }
+  | { type: "stop-recover" }
   | { type: "ask-accepted"; sid: string; text: string }
   | { type: "error-set"; error: AppErrorPayload }
   | { type: "deltas"; sid: string; text: string }
@@ -132,7 +139,14 @@ function reduce(state: State, action: Action): State {
     case "settings-loaded":
       return { ...state, settings: action.view };
     case "start-pressed":
-      return { ...state, phase: "starting", error: null, done: false, capped: false };
+      return {
+        ...state,
+        phase: "starting",
+        error: null,
+        done: false,
+        capped: false,
+        stopStranded: false,
+      };
     case "start-accepted": {
       const placed = pushLive(state, {
         id: action.sid,
@@ -158,11 +172,21 @@ function reduce(state: State, action: Action): State {
       return { ...state, phase: "idle", sessionId: null };
     case "stop-accepted":
       return { ...state, phase: "finalizing" };
-    case "stop-not-taken": {
-      // The stop went nowhere (rule: this return is the only way we learn) —
-      // recover instead of sitting in "Finalizing…" forever.
+    case "stop-not-taken":
+      // Stay put and keep tracking: the session may be mid-finalize from the
+      // 120 s cap, in which case its answer is still coming. `stopStranded`
+      // arms the bounded fallback for the case where it really is gone.
+      return { ...state, phase: "finalizing", stopStranded: true };
+    case "stop-recover": {
+      // Nothing arrived after a refused stop, so the session really was gone.
       const retired = retireLive(state);
-      return { ...state, ...retired, phase: "idle", sessionId: null };
+      return {
+        ...state,
+        ...retired,
+        phase: "idle",
+        sessionId: null,
+        stopStranded: false,
+      };
     }
     case "ask-accepted": {
       const placed = pushLive(state, {
@@ -255,7 +279,15 @@ function reduceEvent(state: State, detail: AppEventDetail): State {
             }
           : entry,
       );
-      return { ...state, entries, phase: "idle", sessionId: null, done: true, rms: 0 };
+      return {
+        ...state,
+        entries,
+        phase: "idle",
+        sessionId: null,
+        done: true,
+        rms: 0,
+        stopStranded: false,
+      };
     }
     case "session:error": {
       const error = detail.payload.error as AppErrorPayload | undefined;
@@ -268,6 +300,7 @@ function reduceEvent(state: State, detail: AppEventDetail): State {
         sessionId: null,
         error,
         rms: 0,
+        stopStranded: false,
       };
     }
     case "audio:level": {
@@ -397,6 +430,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // A refused stop leaves us waiting on an answer that may or may not be
+    // coming. Give it a bounded grace period rather than either hanging in
+    // "Finalizing…" forever or destroying a live session outright.
+    if (!state.stopStranded) return;
+    const id = window.setTimeout(
+      () => dispatch({ type: "stop-recover" }),
+      STOP_RECOVERY_MS,
+    );
+    return () => window.clearTimeout(id);
+  }, [state.stopStranded]);
+
+  useEffect(() => {
     if (state.phase !== "recording") return;
     const id = window.setInterval(() => dispatch({ type: "tick" }), 1000);
     return () => window.clearInterval(id);
@@ -429,9 +474,12 @@ export default function App() {
     dispatch({ type: "stop-accepted" });
     const result = await bridge.stopSession(sid);
     if (!result.ok) {
-      // Not taken: the session is connecting or already gone. Recover.
-      void bridge.cancelSession(sid);
-      trackedRef.current = null;
+      // The core refused. Either the session really is gone, or it already
+      // stopped ITSELF — the 120 s cap auto-stops and is finalizing right
+      // now. Cancelling here would throw away the answer to a question the
+      // user just spent two minutes asking, so never do that: keep waiting
+      // and let the terminal event land. If none is coming, the timer below
+      // recovers us instead of sitting in "Finalizing…" forever.
       dispatch({ type: "stop-not-taken" });
     }
   }, []);

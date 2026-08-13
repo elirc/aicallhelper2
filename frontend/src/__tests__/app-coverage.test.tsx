@@ -2,7 +2,7 @@
  * Gaps the 15-agent audit named precisely: behaviors that were implemented
  * but that no test would have caught a regression in.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -142,6 +142,13 @@ describe("pre-adoption event buffering on the ask path", () => {
 });
 
 describe("stop-not-taken keeps captured work", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("retires a transcript the user already spoke", async () => {
     api.stop_session.mockResolvedValueOnce(err("internal", "Stop not taken"));
     await renderApp();
@@ -152,6 +159,9 @@ describe("stop-not-taken keeps captured work", () => {
     emit("stt:partial", { sessionId: "s1", text: "a real question", isFinal: true });
     fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
     await settle();
+    act(() => {
+      vi.advanceTimersByTime(21_000); // the bounded fallback, no answer came
+    });
     // Recovered to idle AND the transcript survived as history (user work).
     expect(screen.getByText(/Ready — press Record/)).toBeInTheDocument();
     expect(screen.getByText("2/2")).toBeInTheDocument();
@@ -167,6 +177,9 @@ describe("stop-not-taken keeps captured work", () => {
     await settle();
     fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
     await settle();
+    act(() => {
+      vi.advanceTimersByTime(21_000);
+    });
     expect(screen.queryByText("2/2")).toBeNull(); // no empty husk entry
     expect(screen.getByText("earlier answer")).toBeInTheDocument();
   });
@@ -219,5 +232,59 @@ describe("regenerate targets the VIEWED entry", () => {
   it("is hidden for an entry with no question", async () => {
     await renderApp();
     expect(screen.queryByRole("button", { name: "Regenerate" })).toBeNull();
+  });
+});
+
+describe("a stop that races the 120s cap", () => {
+  it("does not destroy the answer the cap is already producing", async () => {
+    // The cap auto-stops in the core, so a Stop press already in flight is
+    // refused. Treating that as "session is gone" and cancelling threw away
+    // the answer to a question the user spent two minutes asking.
+    api.stop_session.mockResolvedValueOnce(err("internal", "Stop not taken"));
+    await renderApp();
+    api.start_session.mockResolvedValueOnce(ok("s1"));
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    await settle();
+    emit("stt:partial", { sessionId: "s1", text: "a long question", isFinal: true });
+    // The core hit the cap and is already finalizing; the UI has not seen the
+    // autostopped event yet, so the user's Stop press is refused.
+    fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
+    await settle();
+
+    expect(api.cancel_session).not.toHaveBeenCalled();
+    // The session is still tracked, so its answer still lands.
+    emit("llm:delta", { sessionId: "s1", delta: "the hard-won " });
+    emit("llm:done", {
+      sessionId: "s1",
+      transcript: "a long question",
+      answer: "the hard-won answer",
+      metrics: { sttFinalizeMs: 300, firstTokenMs: 900, totalMs: 1500 },
+    });
+    await settle();
+    expect(screen.getByText("the hard-won answer")).toBeInTheDocument();
+    expect(screen.getByText(/Done — press Record/)).toBeInTheDocument();
+  });
+
+  it("still recovers when the session really is gone", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      api.stop_session.mockResolvedValueOnce(err("internal", "Stop not taken"));
+      render(<App />);
+      await screen.findByText(/Ready — press Record/);
+      api.start_session.mockResolvedValueOnce(ok("s1"));
+      fireEvent.click(screen.getByRole("button", { name: "Record" }));
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
+      await settle();
+      expect(screen.getByText("Finalizing transcript…")).toBeInTheDocument();
+      // Nothing ever arrives: the bounded fallback returns us to idle rather
+      // than hanging in "Finalizing…" forever.
+      act(() => {
+        vi.advanceTimersByTime(21_000);
+      });
+      expect(screen.getByText(/Ready — press Record/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

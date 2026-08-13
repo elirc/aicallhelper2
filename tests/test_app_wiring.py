@@ -97,3 +97,115 @@ class TestWindowWiring:
         assert window.scripts, "the pump never dispatched — is the sink attached?"
         assert "hello" in window.scripts[0]
         assert "app:event" in window.scripts[0]
+
+
+class SlowAffinity:
+    """Refuses until `honor_after` calls, mimicking an HWND that is not ready."""
+
+    def __init__(self, honor_after: int) -> None:
+        self.honor_after = honor_after
+        self.calls = 0
+        self.stored = 0
+
+    def set_affinity(self, hwnd: int, affinity: int) -> bool:
+        self.calls += 1
+        if self.calls > self.honor_after:
+            self.stored = affinity
+            return True
+        return False
+
+    def get_affinity(self, hwnd: int) -> int | None:
+        return self.stored
+
+
+class TestContentProtectionVerdict:
+    """`shown` and `loaded` each start an attempt, so they overlap. A slow
+    loser must never overwrite a fresher verdict: telling the user the window
+    is hidden from screen capture when the latest attempt failed is the worst
+    outcome this app has."""
+
+    def test_a_stale_attempt_cannot_overwrite_a_fresher_verdict(
+        self, application: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app as app_module
+
+        emitted: list[str] = []
+        monkeypatch.setattr(
+            application, "_emit_from_thread", lambda name, payload: emitted.append(name)
+        )
+        monkeypatch.setattr(application, "_hwnd", lambda: 0x1234)
+        monkeypatch.setattr(app_module, "CONTENT_PROTECTION_RETRY_S", 0.01)
+        # Never succeeds — this is the "loser" that will finish last.
+        application._affinity_api = SlowAffinity(honor_after=99)
+
+        import threading as _threading
+
+        started = _threading.Event()
+        original = application._apply_content_protection
+
+        def slow_attempt() -> None:
+            started.set()
+            original()
+
+        loser = _threading.Thread(target=slow_attempt, daemon=True)
+        loser.start()
+        started.wait(timeout=2.0)
+        # A newer attempt claims a higher ticket and succeeds immediately.
+        application._affinity_api = SlowAffinity(honor_after=0)
+        application._apply_content_protection()
+        loser.join(timeout=5.0)
+
+        assert emitted, "no verdict was reported at all"
+        assert emitted[-1] == "protection:ok", emitted
+        assert application._protection_failed is False
+        assert emitted.count("protection:failed") == 0, (
+            "the superseded attempt reported anyway: " + repr(emitted)
+        )
+
+    def test_a_verified_failure_is_reported(
+        self, application: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app as app_module
+
+        emitted: list[str] = []
+        monkeypatch.setattr(
+            application, "_emit_from_thread", lambda name, payload: emitted.append(name)
+        )
+        monkeypatch.setattr(application, "_hwnd", lambda: 0x1234)
+        monkeypatch.setattr(app_module, "CONTENT_PROTECTION_RETRY_S", 0.001)
+        application._affinity_api = SlowAffinity(honor_after=99)
+        application._apply_content_protection()
+        assert emitted == ["protection:failed"]
+        assert application._protection_failed is True
+
+    def test_a_late_ready_hwnd_still_succeeds_via_retries(
+        self, application: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app as app_module
+
+        emitted: list[str] = []
+        monkeypatch.setattr(
+            application, "_emit_from_thread", lambda name, payload: emitted.append(name)
+        )
+        monkeypatch.setattr(application, "_hwnd", lambda: 0x1234)
+        monkeypatch.setattr(app_module, "CONTENT_PROTECTION_RETRY_S", 0.001)
+        application._affinity_api = SlowAffinity(honor_after=2)  # ready on attempt 3
+        application._apply_content_protection()
+        assert emitted == ["protection:ok"]
+
+
+class TestMinimizedGeometry:
+    def test_minimized_window_bounds_are_not_persisted(self) -> None:
+        import app as app_module
+
+        # Windows parks minimized windows at (-32000, -32000) with a
+        # titlebar-sized rect; saving it loses the geometry the user arranged.
+        assert not app_module.plausible_bounds(
+            {"x": -32000, "y": -32000, "width": 237, "height": 39}
+        )
+        assert not app_module.plausible_bounds(
+            {"x": 100, "y": 100, "width": 10, "height": 10}
+        )
+        # Real geometry, including a monitor left of the primary, still saves.
+        assert app_module.plausible_bounds({"x": 100, "y": 100, "width": 460, "height": 700})
+        assert app_module.plausible_bounds({"x": -1500, "y": 40, "width": 460, "height": 700})

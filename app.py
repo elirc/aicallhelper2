@@ -114,6 +114,17 @@ def loop_exception_handler(
         log("asyncio", detail)
 
 
+# Windows parks minimized windows at this sentinel coordinate.
+MINIMIZED_SENTINEL = -30000
+
+
+def plausible_bounds(bounds: dict[str, int]) -> bool:
+    """False for geometry a minimized (or otherwise unreal) window reports."""
+    if bounds["x"] <= MINIMIZED_SENTINEL or bounds["y"] <= MINIMIZED_SENTINEL:
+        return False
+    return bounds["width"] >= MIN_SIZE[0] and bounds["height"] >= MIN_SIZE[1]
+
+
 # ---------------------------------------------------------- single instance
 
 
@@ -330,6 +341,11 @@ class App:
                 "width": int(window.width),
                 "height": int(window.height),
             }
+            if not plausible_bounds(bounds):
+                # Minimizing reports Location (-32000, -32000) and a titlebar
+                # -sized Size; persisting that loses the geometry the user
+                # actually arranged the moment they minimize and quit.
+                return
             self.settings.set_window_bounds(bounds)
         except Exception:
             pass  # geometry is cosmetic — never raise, especially at shutdown

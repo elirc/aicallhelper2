@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (288 tests)
-cd frontend && npm test                        # frontend (146 tests)
+.venv\Scripts\python -m pytest tests -q        # core (297 tests)
+cd frontend && npm test                        # frontend (148 tests)
 ```
 
 ---
@@ -982,3 +982,55 @@ Resampling each device chunk standalone was wrong three ways, all measured:
   ever was, so a device unplugged mid-question (or Windows switching the
   default output, which leaves the stream bound to a dead endpoint) now
   warns instead of recording silence to the end.
+
+---
+
+## Mutation-testing pass (2026-08-13)
+
+Eighteen mutations were applied one at a time against the green suite. **Seven
+survived** — guards no assertion actually protected. Each is now closed, and
+the fix was verified by re-applying the mutation.
+
+- **`ask()`'s `_require_ticket` was deletable with all 288 tests green.** The
+  only ticket test stalls `start_session`, so `ask`'s copy was never
+  load-bearing. `TestMutationSurvivors::test_a_stalled_ask_never_supersedes_a_
+  later_command` mirrors it with a stalled *ask*.
+- **`retry.py`'s `not got_delta` was never exercised.**
+  `test_never_after_a_delta` used a `stream_drop` failure, which
+  `is_retryable` rejects anyway — so the retry was skipped for the wrong
+  reason and the guard proved nothing. Now uses a `connect` failure, making
+  `got_delta` the only thing preventing a doubled answer.
+- **CloseStream ordering passed by accident.** On a fast loopback socket the
+  sender drains the queue synchronously before finalize runs, so a direct
+  `ws.send` could never be observed overtaking. `TestCloseStreamUnderBack
+  pressure` stalls the first write so the race is real; verified to fail when
+  the sentinel is replaced by a direct send.
+- **Content protection had zero coverage** — no test referenced
+  `_apply_content_protection`, `protection:ok`, or `protection:failed` at
+  all. `TestContentProtectionVerdict` now covers a superseded slow attempt
+  (must not overwrite a fresher verdict), a verified failure, and a late-ready
+  HWND succeeding through the retries.
+- **`f²` was accepted back** when `isdecimal()`+`isascii()` reverted to
+  `isdigit()`: the never-raise test's candidate list had no `f<superscript>`
+  input. Added, along with `f٢` (Arabic-Indic digits would otherwise map to a
+  real F-key).
+- **`_on_frame`'s `stop_requested` check and `_emit`'s `errored` guard** are
+  defense-in-depth masked by synchronous sibling checks, so no loop-driven
+  test could separate them. Both are now driven directly against the machine's
+  own state — the window they cover is only reachable from a real audio
+  thread, which is exactly why it needs a test rather than a reader's trust.
+
+## Fresh-eyes findings (2026-08-13)
+
+- **A Stop press racing the 120 s cap destroyed the answer.** Once the cap
+  auto-stops, `stop_session` correctly returns "not taken" — but the frontend
+  treated *any* refused stop as "the session is gone" and called
+  `cancel_session`, superseding a session that was mid-finalize. Two minutes
+  of recording produced no answer, no error, nothing. The refused-stop path no
+  longer cancels; it keeps tracking and falls back to idle only after a
+  bounded wait. Covered by `a stop that races the 120s cap` (both the
+  answer-survives and the really-gone branches).
+- **Minimizing persisted garbage geometry.** Windows reports minimized windows
+  at (-32000, -32000) with a titlebar-sized rect; the debounced save wrote it,
+  so quitting while minimized lost the window position the user had arranged.
+  `plausible_bounds` now rejects it (`TestMinimizedGeometry`).

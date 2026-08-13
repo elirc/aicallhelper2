@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -99,15 +99,26 @@ describe("record flow", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("a not-taken stop recovers to idle instead of hanging in Finalizing", async () => {
-    api.stop_session.mockResolvedValueOnce(err("internal", "Stop not taken"));
-    await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Record" }));
-    await settle();
-    fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
-    await settle();
-    expect(api.cancel_session).toHaveBeenCalledWith("s1");
-    expect(screen.getByText(/Ready — press Record/)).toBeInTheDocument();
+  it("a not-taken stop waits, then recovers instead of hanging in Finalizing", async () => {
+    // It must NOT cancel: the core may have auto-stopped at the 120s cap and
+    // still be producing the answer. Recovery is a bounded fallback.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      api.stop_session.mockResolvedValueOnce(err("internal", "Stop not taken"));
+      await renderApp();
+      fireEvent.click(screen.getByRole("button", { name: "Record" }));
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
+      await settle();
+      expect(api.cancel_session).not.toHaveBeenCalled();
+      expect(screen.getByText("Finalizing transcript…")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(21_000);
+      });
+      expect(screen.getByText(/Ready — press Record/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("start failure shows the actionable error", async () => {

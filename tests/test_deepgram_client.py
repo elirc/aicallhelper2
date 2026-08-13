@@ -495,3 +495,54 @@ class TestProductionWireConstants:
             assert messages.count("KeepAlive") >= 2
         finally:
             box.server.close()
+
+
+class TestCloseStreamUnderBackpressure:
+    async def test_closestream_waits_behind_a_stalled_sender(self) -> None:
+        """The ordering test above passes even with a direct ws.send, because
+        on a fast local socket the sender drains the queue synchronously
+        before finalize runs. Stall the sender so the race is real: the
+        sentinel must still leave last, or Deepgram discards the tail of the
+        question at exactly the moment the user pressed Stop."""
+        order: list[str] = []
+
+        async def handler(ws: ServerConnection) -> None:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    order.append(f"audio:{message.decode()}")
+                elif json.loads(message).get("type") == "CloseStream":
+                    order.append("close")
+                    await ws.send(results_frame("done", True))
+                    await ws.close()
+                    return
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec, finalize_timeout=3.0)
+            await stream.connect()
+            released = asyncio.Event()
+            real_send = stream._ws.send
+            first = {"seen": False}
+
+            async def stalling_send(payload: object) -> None:
+                # Hold the very first write so the queue backs up behind it,
+                # exactly like a congested socket during a call.
+                if not first["seen"]:
+                    first["seen"] = True
+                    await released.wait()
+                await real_send(payload)
+
+            stream._ws.send = stalling_send  # type: ignore[method-assign]
+            for i in range(12):
+                stream.send(str(i).encode())
+            await asyncio.sleep(0.1)  # sender is parked on frame 0
+            finalize = asyncio.get_running_loop().create_task(stream.finalize())
+            await asyncio.sleep(0.1)  # a direct send would escape here
+            released.set()
+            await finalize
+            assert order, "nothing reached the server"
+            assert order[-1] == "close", order[-3:]
+            assert order[:12] == [f"audio:{i}" for i in range(12)]
+        finally:
+            box.server.close()
