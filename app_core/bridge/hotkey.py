@@ -20,6 +20,12 @@ import ctypes.wintypes
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
+
+# "invalid" and "unavailable" are different user problems and must not share
+# one message: telling someone their typo is "taken by another app" sends
+# them hunting for a conflict that does not exist.
+HotkeyStatus = Literal["registered", "disabled", "invalid", "unavailable"]
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -114,25 +120,35 @@ class HotkeyManager:
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._registered = False
+        self._status: HotkeyStatus = "disabled"
         self._lock = threading.Lock()
 
     @property
     def registered(self) -> bool:
         return self._registered
 
-    def register(self, accelerator: str) -> bool:
-        """Register (replacing any current hotkey). Empty accelerator =
-        shortcut disabled. Returns True only on real OS-level success."""
+    @property
+    def status(self) -> HotkeyStatus:
+        return self._status
+
+    def register(self, accelerator: str) -> HotkeyStatus:
+        """Register (replacing any current hotkey), reporting WHY on failure.
+
+        "disabled" (empty accelerator) · "invalid" (not a shortcut Windows
+        understands) · "unavailable" (well-formed but the OS refused, i.e.
+        another app owns it) · "registered".
+        """
         with self._lock:
             self._unregister_locked()
             if not accelerator:
-                return False
+                return self._settle("disabled")
             try:
                 parsed = parse_accelerator(accelerator)
             except Exception:
-                return False  # a hand-edited settings file must never brick launch
+                # A hand-edited settings file must never brick launch.
+                return self._settle("invalid")
             if parsed is None:
-                return False
+                return self._settle("invalid")
             result: dict[str, bool] = {}
             ready = threading.Event()
 
@@ -162,17 +178,21 @@ class HotkeyManager:
             thread.start()
             ready.wait(timeout=5.0)
             if result.get("ok"):
-                self._thread = thread
-                self._registered = True
-                return True
+                self._thread = thread  # _thread_id was set inside run()
+                return self._settle("registered")
             self._thread = None
             self._thread_id = None
-            self._registered = False
-            return False
+            return self._settle("unavailable")
+
+    def _settle(self, status: HotkeyStatus) -> HotkeyStatus:
+        self._status = status
+        self._registered = status == "registered"
+        return status
 
     def unregister(self) -> None:
         with self._lock:
             self._unregister_locked()
+            self._settle("disabled")
 
     def _unregister_locked(self) -> None:
         if self._thread is not None and self._thread_id is not None:
@@ -181,3 +201,5 @@ class HotkeyManager:
         self._thread = None
         self._thread_id = None
         self._registered = False
+        # Status is set by the caller (_settle) — unregister_locked also runs
+        # as the first step of a re-register, which will settle it itself.

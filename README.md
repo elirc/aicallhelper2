@@ -136,8 +136,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
 ## Testing
 
 ```
-.venv\Scripts\python -m pytest tests -q      # 261 core tests
-cd frontend && npm test                       # 112 frontend tests
+.venv\Scripts\python -m pytest tests -q      # 275 core tests
+cd frontend && npm test                       # 139 frontend tests
 .venv\Scripts\python -m ruff check app_core app.py tests
 .venv\Scripts\python -m mypy                  # strict, on the core
 cd frontend && npm run typecheck              # TS strict
@@ -196,10 +196,33 @@ LLM.
   lives at the repo root as `app_core/` (same subpackage structure:
   `audio/ stt/ llm/ session/ store/ bridge/`) so imports match the package
   name without a mapping shim.
-- **Events**: one event was ADDED beyond the spec's list —
-  `session:autostopped {sessionId}` — emitted when the 120 s cap fires, so
-  the frontend can honestly transition to "Reached the 120s limit —
-  answering now" without guessing from its own timer.
+- **Events**: three events were ADDED beyond the spec's list.
+  `session:autostopped {sessionId}` fires when the 120 s cap trips, so the
+  frontend can honestly transition to "Reached the 120s limit — answering
+  now" instead of guessing from its own timer. `protection:failed` /
+  `protection:ok` report whether Windows actually confirmed
+  `WDA_EXCLUDEFROMCAPTURE` (see below).
+- **Content protection is verified, and its failure is visible.**
+  `SetWindowDisplayAffinity` can fail (an HWND that is not ready yet, policy,
+  Windows builds older than 2004). The app applies it, reads the affinity
+  back, retries briefly, and — if the OS never confirms — shows a standing
+  warning in the window. A user who believes they are hidden while being
+  broadcast is this product's worst outcome, so it is not a log line.
+- **Silent-capture hint** (addition to §9's main view): after ~5 s of
+  recording with no audible frame, a line appears suggesting the call audio
+  may be going somewhere other than the speakers. Loopback capturing silence
+  — headset, wrong output device, muted call — is the most common real-world
+  failure, and otherwise the user only discovers it at Stop, after the
+  question is gone. It clears the instant audio arrives.
+- **Hotkey failure is reported honestly**: the settings view carries a
+  `hotkeyStatus` of `registered` / `disabled` / `invalid` / `unavailable`.
+  The spec's "already taken by another app" copy is used only for
+  `unavailable`; an unparseable accelerator says so instead of sending the
+  user to hunt for a conflict that does not exist.
+- **Event dispatch is batched**: the pump drains whatever is queued into one
+  `evaluate_js` call (capped at 64), preserving order. Each call is a
+  blocking round trip on a worker thread and an answer streams dozens of
+  deltas per second.
 - **Event-race hardening**: the frontend buffers events whose session id is
   unknown *while a start/ask command is still in flight* and replays them on
   adoption (pywebview's promise resolution and `evaluate_js` events race;

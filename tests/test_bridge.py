@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 import app_core.bridge.api as api_module
+import app_core.bridge.events as events_module
 from app_core.bridge.api import JsApi
 from app_core.bridge.events import WebviewEventSink
 from app_core.errors import AppError
@@ -187,13 +188,18 @@ class FakeWindow:
         self.scripts.append(code)
 
 
-def decode_detail(code: str) -> dict[str, Any]:
+def decode_details(code: str) -> list[dict[str, Any]]:
+    """One evaluate_js call carries a BATCH of events (see events.MAX_BATCH)."""
     prefix = "JSON.parse("
     start = code.index(prefix) + len(prefix)
-    literal = code[start:-4]  # strip the trailing )}))
-    payload = json.loads(json.loads(literal))
-    assert isinstance(payload, dict)
+    end = code.index(").forEach(")
+    payload = json.loads(json.loads(code[start:end]))
+    assert isinstance(payload, list)
     return payload
+
+
+def all_details(scripts: list[str]) -> list[dict[str, Any]]:
+    return [detail for code in scripts for detail in decode_details(code)]
 
 
 class TestEventSink:
@@ -206,9 +212,12 @@ class TestEventSink:
         for i in range(5):
             sink.emit("llm:delta", {"sessionId": "s1", "delta": f"{hostile}{i}"})
         deadline = asyncio.get_running_loop().time() + 2.0
-        while len(window.scripts) < 5 and asyncio.get_running_loop().time() < deadline:
+        while (
+            len(all_details(window.scripts)) < 5
+            and asyncio.get_running_loop().time() < deadline
+        ):
             await asyncio.sleep(0.02)
-        details = [decode_detail(code) for code in window.scripts]
+        details = all_details(window.scripts)
         assert [d["name"] for d in details] == ["llm:delta"] * 5
         assert [d["payload"]["delta"] for d in details] == [
             f"{hostile}{i}" for i in range(5)
@@ -224,16 +233,100 @@ class TestEventSink:
         deadline = asyncio.get_running_loop().time() + 2.0
         while not window.scripts and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
-        assert decode_detail(window.scripts[0])["payload"]["text"] == "early"
+        assert all_details(window.scripts)[0]["payload"]["text"] == "early"
 
     async def test_a_throwing_webview_does_not_kill_the_pump(self) -> None:
         sink = WebviewEventSink()
         window = FakeWindow(fail_first=True)
         sink.attach(window)
         sink.start()
-        sink.emit("a", {"n": 1})
-        sink.emit("b", {"n": 2})
+        sink.emit("a", {"n": 1})  # this dispatch raises
+        await asyncio.sleep(0.15)
+        sink.emit("b", {"n": 2})  # the pump must still be alive for this one
         deadline = asyncio.get_running_loop().time() + 2.0
         while not window.scripts and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
-        assert decode_detail(window.scripts[0])["name"] == "b"
+        assert [d["name"] for d in all_details(window.scripts)] == ["b"]
+
+
+class TestEventBatching:
+    """Each evaluate_js is a blocking round trip on a worker thread and an
+    answer streams dozens of deltas per second, so the pump batches whatever
+    is already queued — without ever reordering."""
+
+    async def test_a_burst_is_delivered_in_one_call_in_order(self) -> None:
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        for i in range(20):
+            sink.emit("llm:delta", {"sessionId": "s1", "delta": str(i)})
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            len(all_details(window.scripts)) < 20
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        details = all_details(window.scripts)
+        assert [d["payload"]["delta"] for d in details] == [str(i) for i in range(20)]
+        # The whole burst was already queued, so it must not cost 20 hops.
+        assert len(window.scripts) < 20
+
+    async def test_batches_never_exceed_the_cap(self) -> None:
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        total = events_module.MAX_BATCH * 2 + 5
+        for i in range(total):
+            sink.emit("llm:delta", {"sessionId": "s1", "delta": str(i)})
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while (
+            len(all_details(window.scripts)) < total
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        assert all(
+            len(decode_details(code)) <= events_module.MAX_BATCH for code in window.scripts
+        )
+        assert [d["payload"]["delta"] for d in all_details(window.scripts)] == [
+            str(i) for i in range(total)
+        ]
+
+    async def test_mixed_event_names_keep_their_relative_order(self) -> None:
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        emitted = [
+            ("stt:partial", {"sessionId": "s1", "text": "q"}),
+            ("llm:delta", {"sessionId": "s1", "delta": "a"}),
+            ("llm:delta", {"sessionId": "s1", "delta": "b"}),
+            ("llm:done", {"sessionId": "s1", "answer": "ab"}),
+        ]
+        for name, payload in emitted:
+            sink.emit(name, payload)
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            len(all_details(window.scripts)) < len(emitted)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        assert [d["name"] for d in all_details(window.scripts)] == [n for n, _ in emitted]
+
+    async def test_javascript_line_separators_cannot_break_out_of_the_script(self) -> None:
+        # U+2028/U+2029 are line terminators in JS source; the outer dump must
+        # escape them or the generated script is syntactically broken.
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        hostile = "line" + chr(0x2028) + "sep" + chr(0x2029) + r"""para</script>\ " '"""
+        sink.emit("llm:delta", {"sessionId": "s1", "delta": hostile})
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while not window.scripts and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert all_details(window.scripts)[0]["payload"]["delta"] == hostile
+        # Escaped as  , never emitted raw into the JS source.
+        assert chr(0x2028) not in window.scripts[0]
+        assert chr(0x2029) not in window.scripts[0]

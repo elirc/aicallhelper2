@@ -44,6 +44,8 @@ export interface SettingsView {
   hotkey: string;
   providers: ProviderChoice[];
   hotkeyRegistered: boolean;
+  /** Why the shortcut is off, so the UI never blames another app for a typo. */
+  hotkeyStatus: "registered" | "disabled" | "invalid" | "unavailable";
   /** hasDeepgramKey, hasAnthropicKey, ... generated from the provider registry. */
   [key: string]: unknown;
 }

@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (261 tests)
-cd frontend && npm test                        # frontend (112 tests)
+.venv\Scripts\python -m pytest tests -q        # core (275 tests)
+cd frontend && npm test                        # frontend (139 tests)
 ```
 
 ---
@@ -807,3 +807,98 @@ each of these tests exists because a specific one of them shipped.
   on the answer panel, `role="status"`, `role="alert"`.
 - **…copy confirmation timing** — "Copied ✓" reverts to "Copy".
 - **…history guards** — Clear is disabled while a session is live.
+
+---
+
+## Hardening pass (2026-08-13)
+
+### tests/test_protection.py — content protection is verified, not assumed
+
+Being invisible to screen sharing is the moat feature, and
+`SetWindowDisplayAffinity` returns a BOOL that is trivially ignored.
+
+- **test_success_requires_the_os_to_confirm** — success means the affinity
+  READ BACK equals `WDA_EXCLUDEFROMCAPTURE`, not that the setter returned
+  truthy.
+- **test_set_that_reports_success_but_did_not_stick_is_a_failure** — the
+  whole reason for the read-back.
+- **test_partial_protection_is_not_protection** — `WDA_MONITOR` hides from
+  some capture paths but not the ones that matter for screen sharing.
+- **test_unreadable_affinity_is_a_failure /
+  test_a_throwing_api_fails_closed_instead_of_crashing_the_window_callback**
+  — fail closed, and never raise out of a pywebview event callback.
+- **test_missing_hwnd_fails_without_calling_the_os** — no HWND yet (the app
+  retries) must not be reported as protected.
+- **test_constants_match_the_win32_values** — the constants are the contract.
+
+### tests/test_bridge.py::TestEventBatching — batched dispatch
+
+Each `evaluate_js` is a blocking round trip on a worker thread and an answer
+streams dozens of deltas per second, so the pump now drains the queue into
+one call.
+
+- **test_a_burst_is_delivered_in_one_call_in_order** — 20 queued deltas
+  arrive in order and cost far fewer than 20 hops.
+- **test_batches_never_exceed_the_cap** — a backed-up queue cannot produce
+  one enormous script; order still holds across batch boundaries.
+- **test_mixed_event_names_keep_their_relative_order** — batching must never
+  reorder `stt:partial` → deltas → `llm:done`.
+- **test_javascript_line_separators_cannot_break_out_of_the_script** —
+  U+2028/U+2029 are JS source line terminators; the outer encode escapes them
+  or the generated script is syntactically broken.
+- **test_a_throwing_webview_does_not_kill_the_pump** (rewritten) — a failed
+  dispatch loses that batch (the renderer is dying anyway) but the pump must
+  still deliver later events.
+
+### tests/test_hotkey.py::TestRegistrationStatus
+
+- **test_empty_accelerator_is_disabled_not_a_failure /
+  test_unparseable_accelerator_reports_invalid** — "invalid" and "taken by
+  another app" are different user problems; collapsing them into one bare
+  `False` sent people hunting for a conflicting app when they had a typo.
+- **test_a_real_registration_reports_registered_and_a_conflict_unavailable**
+  — real `RegisterHotKey` against an obscure combination, then a second
+  manager contending for it, so the "unavailable" branch is exercised for
+  real (skips if the environment refuses the probe key).
+
+### Frontend — src/__tests__/app-signals.test.tsx
+
+- **silent-capture hint (7 tests)** — loopback capture that produces nothing
+  (audio on a headset, wrong output device, muted call) is the most common
+  real-world failure, and today the user only learns at Stop. The hint
+  appears after sustained silence while recording, never on a short pause,
+  never once any audible frame arrived, treats digital silence as silence,
+  clears the instant audio flows, disappears at Stop, and resets between
+  recordings.
+- **hotkey status messaging (4 tests)** — blames another app only for
+  `unavailable`, says "isn't a shortcut Windows understands" for `invalid`,
+  stays silent when the user deliberately disabled it.
+- **content-protection warning (4 tests)** — silent while protection holds,
+  a `role="alert"` when Windows refused, clears on a later success, and
+  survives a recording cycle.
+- **level meter accessibility** — the meter is `aria-hidden`; a bar that
+  changes eight times a second is noise in a screen reader, and the silence
+  hint now carries the same meaning in words.
+
+### Frontend — src/__tests__/app-coverage.test.tsx (audit gaps)
+
+- **clipboard fallback failure (3 tests)** — `execCommand` returning false
+  must throw so the UI reports it instead of showing a false "Copied ✓", and
+  neither path may leak a stray `<textarea>` into the DOM.
+- **pre-adoption buffering on the ask path (3 tests)** — the buffer-and-
+  replay race was only covered for `start_session`; now also for `ask`, plus
+  the buffer being discarded when a start or ask fails so a later session
+  cannot inherit orphaned events.
+- **stop-not-taken keeps captured work (2 tests)** — a transcript the user
+  already spoke is retired into history; an attempt that captured nothing is
+  discarded.
+- **regenerate targets the VIEWED entry (3 tests)** — re-asks the entry you
+  navigated back to (not the newest), stays available while an answer streams
+  and supersedes it, hidden when there is no question.
+
+### markdown-render.test.tsx — extended streaming corpus
+
+The invariant corpus was six documents, longest 78 characters. It now also
+includes CRLF documents (so a cut between `\r` and `\n` is exercised), mixed
+line endings, nested and adjacent emphasis, a control character inside list
+item text, and a ~500-character realistic answer — every cut point of each.

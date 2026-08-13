@@ -3,8 +3,8 @@
  * plus a dispatcher for `app:event` CustomEvents — the same seam production
  * uses, driving the REAL components.
  */
-import { act } from "@testing-library/react";
-import { vi, type Mock } from "vitest";
+import { act, screen, waitFor } from "@testing-library/react";
+import { expect, vi, type Mock } from "vitest";
 
 import type { Result, SettingsView } from "../types";
 
@@ -21,6 +21,7 @@ export function settingsView(overrides: Partial<SettingsView> = {}): SettingsVie
       { id: "groq", displayName: "Groq GPT-OSS 120B (fastest)" },
     ],
     hotkeyRegistered: true,
+    hotkeyStatus: "registered",
     hasDeepgramKey: true,
     hasAnthropicKey: true,
     hasGroqKey: false,
@@ -67,6 +68,26 @@ export function emit(name: string, payload: Record<string, unknown>): void {
       new CustomEvent("app:event", { detail: { name, payload } }),
     );
   });
+}
+
+/**
+ * Wait until get_settings has actually landed in the view.
+ *
+ * The status line renders immediately with `settings === null`, so awaiting
+ * it does NOT prove settings arrived — assertions about hotkey chips or
+ * notices raced the load and only failed under parallel-suite load. The
+ * style chips reflect the PERSISTED style, so a pressed chip is a true
+ * settings-loaded signal.
+ */
+export async function waitForSettings(
+  style: "Brief" | "Balanced" | "Detailed" = "Balanced",
+): Promise<void> {
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: style })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    ),
+  );
 }
 
 /** Let microtasks (bridge promise chains) settle inside act. */

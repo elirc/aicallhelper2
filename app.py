@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import faulthandler
 import os
 import sys
@@ -25,6 +24,10 @@ import httpx
 from app_core.bridge.api import JsApi
 from app_core.bridge.events import WebviewEventSink
 from app_core.bridge.hotkey import HotkeyManager
+from app_core.bridge.protection import (
+    Win32DisplayAffinity,
+    apply_content_protection,
+)
 from app_core.llm.base import default_registry
 from app_core.llm.warm import PreWarmer
 from app_core.session.machine import OnSttError, OnSttUpdate, SessionManager
@@ -38,7 +41,8 @@ WINDOW_TITLE = "AI Call Assistant"
 DEFAULT_SIZE = (460, 700)
 MIN_SIZE = (380, 520)
 BACKGROUND = "#16181d"
-WDA_EXCLUDEFROMCAPTURE = 0x11
+CONTENT_PROTECTION_ATTEMPTS = 5
+CONTENT_PROTECTION_RETRY_S = 0.2
 MUTEX_NAME = "Local\\AICallAssistantV3Mutex"
 FOCUS_EVENT_NAME = "Local\\AICallAssistantV3Focus"
 BOUNDS_DEBOUNCE_S = 0.5
@@ -184,6 +188,8 @@ class App:
         self._bounds_timer: threading.Timer | None = None
         self._last_reload = 0.0
         self._current_accelerator: str | None = None
+        self._affinity_api = Win32DisplayAffinity()
+        self._protection_failed = False
         self._entry_url = resolve_entry_url()
 
         self.http = httpx.AsyncClient(
@@ -216,6 +222,7 @@ class App:
             self.machine,
             self.settings,
             hotkey_registered=lambda: self.hotkey.registered,
+            hotkey_status=lambda: self.hotkey.status,
             on_settings_changed=self._apply_settings,
         )
 
@@ -258,17 +265,39 @@ class App:
                 return 0
 
     def _apply_content_protection(self) -> None:
-        # Invisible to screen sharing — a moat feature. Re-applied on every
-        # load in case the window was recreated.
-        hwnd = self._hwnd()
-        if hwnd:
-            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        """Invisible to screen sharing — the moat feature. Applied AND
+        verified: a window the user believes is hidden while it is being
+        broadcast is the worst outcome this app has, so a failure that
+        survives the retries is reported to them rather than logged."""
+        protected = False
+        for attempt in range(CONTENT_PROTECTION_ATTEMPTS):
+            if apply_content_protection(self._hwnd(), self._affinity_api):
+                protected = True
+                break
+            # The HWND may not be ready in the first instants after `shown`.
+            time.sleep(CONTENT_PROTECTION_RETRY_S * (attempt + 1))
+        self._protection_failed = not protected
+        # Always emit, never only on transition: this also runs after a
+        # renderer reload, where the page has lost the previous state.
+        self._emit_from_thread("protection:ok" if protected else "protection:failed", {})
+
+    def _emit_from_thread(self, name: str, payload: dict[str, Any]) -> None:
+        # Window callbacks run on pywebview's threads; the sink queue lives
+        # on the core loop.
+        with contextlib.suppress(Exception):
+            self.loop.call_soon_threadsafe(self.sink.emit, name, payload)
+
+    def _protect_async(self) -> None:
+        # Never block a pywebview event callback on the retry sleeps.
+        threading.Thread(
+            target=self._apply_content_protection, name="content-protection", daemon=True
+        ).start()
 
     def _on_shown(self) -> None:
-        self._apply_content_protection()
+        self._protect_async()
 
     def _on_loaded(self) -> None:
-        self._apply_content_protection()
+        self._protect_async()
 
     def _schedule_bounds_save(self) -> None:
         # Debounced on move/resize AND flushed on close: the debounced save

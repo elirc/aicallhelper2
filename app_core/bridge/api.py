@@ -41,12 +41,14 @@ class JsApi:
         settings: SettingsStore,
         *,
         hotkey_registered: Callable[[], bool] = lambda: False,
+        hotkey_status: Callable[[], str] = lambda: "disabled",
         on_settings_changed: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._loop = loop
         self._machine = machine
         self._settings = settings
         self._hotkey_registered = hotkey_registered
+        self._hotkey_status = hotkey_status
         self._on_settings_changed = on_settings_changed
         self.last_heartbeat = time.monotonic()
 
@@ -104,7 +106,11 @@ class JsApi:
             return _err(AppError("internal", "Something went wrong inside the app core."))
 
     def _decorate(self, view: dict[str, Any]) -> dict[str, Any]:
-        return {**view, "hotkeyRegistered": self._hotkey_registered()}
+        return {
+            **view,
+            "hotkeyRegistered": self._hotkey_registered(),
+            "hotkeyStatus": self._hotkey_status(),
+        }
 
     async def _get_settings(self) -> dict[str, Any]:
         view = await asyncio.to_thread(self._settings.view)

@@ -191,34 +191,42 @@ class DeepgramStream:
         close_detail = ""
         abnormal_close = False
         try:
-            async for message in ws:
-                if isinstance(message, bytes | bytearray):
-                    continue
-                parsed = parse_frame(message)
-                if isinstance(parsed, TranscriptSegment):
-                    self._got_results = True
-                    text = self._acc.apply(parsed)
-                    if not self._aborted:
-                        self._on_update(text, parsed.is_final)
-                elif isinstance(parsed, SttErrorDetail):
-                    error = AppError(
-                        "stt_error", f"Deepgram reported an error: {parsed.detail}"
-                    )
-                    break
-        except ConnectionClosedError as exc:
-            abnormal_close = True
-            close_detail = _close_detail(exc)
-        except ConnectionClosed:
-            pass
-        except asyncio.CancelledError:
+            try:
+                async for message in ws:
+                    if isinstance(message, bytes | bytearray):
+                        continue
+                    parsed = parse_frame(message)
+                    if isinstance(parsed, TranscriptSegment):
+                        self._got_results = True
+                        text = self._acc.apply(parsed)
+                        if not self._aborted:
+                            self._on_update(text, parsed.is_final)
+                    elif isinstance(parsed, SttErrorDetail):
+                        error = AppError(
+                            "stt_error", f"Deepgram reported an error: {parsed.detail}"
+                        )
+                        break
+            except ConnectionClosedError as exc:
+                abnormal_close = True
+                close_detail = _close_detail(exc)
+            except ConnectionClosed:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                abnormal_close = True
             self._closed = True
-            self._closed_evt.set()
-            raise
-        except Exception:
-            abnormal_close = True
+            self._classify_close(error, abnormal_close, close_detail)
         finally:
+            # Set LAST, after classification. finalize() wakes on this event
+            # and cancels the remaining tasks, so setting it earlier would
+            # race this task's own error reporting.
             self._closed = True
             self._closed_evt.set()
+
+    def _classify_close(
+        self, error: AppError | None, abnormal_close: bool, close_detail: str
+    ) -> None:
         if error is not None:
             self._report_error(error)
             return
@@ -226,7 +234,9 @@ class DeepgramStream:
             # Expected close during finalize/abort — but an ABNORMAL close
             # mid-finalize is a stream death and must surface (rule 5; the
             # machine ignores it once the transcript is finalized).
-            if abnormal_close and not self._aborted and not self._got_results:
+            if not abnormal_close or self._aborted:
+                return
+            if not self._got_results:
                 # Never transcribed anything: this is the bad-key rejection
                 # (1008 DATA-xxxx), which must keep its connect-failure
                 # classification even though a stop was already requested.
@@ -238,13 +248,12 @@ class DeepgramStream:
                     )
                 )
                 return
-            if abnormal_close and not self._aborted:
-                self._report_error(
-                    AppError(
-                        "stt_error",
-                        f"Lost the Deepgram connection while finalizing{close_detail}.",
-                    )
+            self._report_error(
+                AppError(
+                    "stt_error",
+                    f"Lost the Deepgram connection while finalizing{close_detail}.",
                 )
+            )
             return
         if not self._got_results:
             # Close before any Results frame = connect-level rejection

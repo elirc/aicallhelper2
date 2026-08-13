@@ -14,6 +14,9 @@ import contextlib
 import json
 from typing import Any
 
+# Cap so one evaluate_js string stays small even if the queue backs up.
+MAX_BATCH = 64
+
 
 class WebviewEventSink:
     def __init__(self) -> None:
@@ -33,15 +36,31 @@ class WebviewEventSink:
 
     async def _pump(self) -> None:
         while True:
-            name, payload = await self._queue.get()
+            first = await self._queue.get()
             while self._window is None:
                 await asyncio.sleep(0.05)  # window not created yet — hold, don't drop
-            detail = json.dumps({"name": name, "payload": payload}, ensure_ascii=False)
+            # Drain whatever else is already queued into ONE evaluate_js.
+            # Each call is a blocking round trip on a worker thread, and an
+            # answer streams dozens of deltas per second — batching keeps
+            # those hops off the latency budget. Order is preserved: the
+            # queue is FIFO and the page dispatches the array in order.
+            batch = [first]
+            while len(batch) < MAX_BATCH:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            details = json.dumps(
+                [{"name": name, "payload": payload} for name, payload in batch],
+                ensure_ascii=False,
+            )
             # Double-encode so arbitrary payload text (quotes, backslashes,
-            # newlines) survives the trip through evaluate_js as a JS string.
+            # newlines, U+2028) survives the trip through evaluate_js as a JS
+            # string: the outer dump escapes every non-ASCII character.
             code = (
-                "window.dispatchEvent(new CustomEvent('app:event',"
-                f"{{detail:JSON.parse({json.dumps(detail)})}}))"
+                f"JSON.parse({json.dumps(details)}).forEach("
+                "function(d){window.dispatchEvent("
+                "new CustomEvent('app:event',{detail:d}))})"
             )
             # A dying webview must not kill the core loop.
             with contextlib.suppress(Exception):

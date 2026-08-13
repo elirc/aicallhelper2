@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app_core.bridge.hotkey import (
     MOD_ALT,
     MOD_CONTROL,
     MOD_SHIFT,
     MOD_WIN,
+    HotkeyManager,
     parse_accelerator,
 )
 
@@ -70,3 +73,45 @@ class TestHostileAccelerators:
     def test_no_accelerator_input_ever_raises(self) -> None:
         for candidate in ["ß", "+++", "ctrl+", "ctrl++", "\x00", "🙂", "ctrl+🙂", " " * 5]:
             parse_accelerator(candidate)  # must not raise
+
+
+class TestRegistrationStatus:
+    """"Invalid" and "taken by another app" are different user problems; the
+    UI shows a different message for each, so the manager must distinguish
+    them rather than returning one bare False."""
+
+    def test_empty_accelerator_is_disabled_not_a_failure(self) -> None:
+        manager = HotkeyManager(lambda: None)
+        assert manager.register("") == "disabled"
+        assert manager.status == "disabled"
+        assert manager.registered is False
+
+    def test_unparseable_accelerator_reports_invalid(self) -> None:
+        manager = HotkeyManager(lambda: None)
+        for bad in ["Ctrl+Foo", "Ctrl+Shift", "A+B", "ctrl+ß", "F25"]:
+            assert manager.register(bad) == "invalid", bad
+            assert manager.status == "invalid"
+            assert manager.registered is False
+
+    def test_a_real_registration_reports_registered_and_a_conflict_unavailable(
+        self,
+    ) -> None:
+        # Ctrl+Alt+Shift+F24 is not a shortcut anything else claims.
+        first = HotkeyManager(lambda: None)
+        try:
+            status = first.register("Ctrl+Alt+Shift+F24")
+            if status != "registered":
+                pytest.skip("the OS refused the probe hotkey in this environment")
+            assert first.registered is True
+            second = HotkeyManager(lambda: None)
+            try:
+                # Win32 RegisterHotKey is per-process; a second manager in the
+                # SAME process contends for the same id, which is exactly the
+                # "another app owns it" shape.
+                assert second.register("Ctrl+Alt+Shift+F24") == "unavailable"
+                assert second.registered is False
+            finally:
+                second.unregister()
+        finally:
+            first.unregister()
+        assert first.status == "disabled"

@@ -123,6 +123,17 @@ describe("streaming invariant", () => {
     "- loose\n\n- list\n\nafter **the** list",
     "Answer with unterminated ```\ncode at eof",
     "*open em never closes\n\n## head",
+    // CRLF: the whole document normalizes, so every prefix must too —
+    // including one cut between the \r and the \n.
+    "# CRLF title\r\n\r\n- one\r\n- two\r\n\r\n```js\r\ncode\r\n```\r\n\r\n---\r\n",
+    "mixed \r endings \r\n and \n one paragraph",
+    // Nested and adjacent emphasis, which resolve back-to-front.
+    "***both*** and **bold _inner_ bold** and *a*b*c*",
+    // Control characters are ordinary text and must not disturb block
+    // identity while streaming.
+    `- item${String.fromCharCode(0x1f)}with sep\n- second`,
+    // A realistically long answer: the shipped corpus topped out at 78 chars.
+    ["## Summary", "", ...Array.from({ length: 12 }, (_, i) => `- point ${i} with **bold** and \`code\``), "", "Closing *thought* here."].join("\n"),
   ];
 
   it("every cut point renders identically to a batch render", () => {

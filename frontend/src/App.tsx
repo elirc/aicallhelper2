@@ -38,6 +38,11 @@ interface State {
   view: number;
   error: AppErrorPayload | null;
   rms: number;
+  /** Any audible frame since this recording began (loopback silence is the
+   *  single most common real-world failure: audio routed to a headset, the
+   *  wrong output device, or a muted call). */
+  heardAudio: boolean;
+  protectionFailed: boolean;
   seconds: number;
   capped: boolean;
   done: boolean;
@@ -47,6 +52,10 @@ interface State {
 }
 
 const MAX_HISTORY = 6;
+// Above digital silence and typical comfort noise, below any real speech.
+const AUDIBLE_RMS = 0.003;
+// Long enough that a natural pause in the question never trips it.
+const SILENCE_HINT_AFTER_S = 5;
 
 const initialState: State = {
   phase: "idle",
@@ -55,6 +64,8 @@ const initialState: State = {
   view: 0,
   error: null,
   rms: 0,
+  heardAudio: false,
+  protectionFailed: false,
   seconds: 0,
   capped: false,
   done: false,
@@ -80,7 +91,8 @@ type Action =
   | { type: "settings-close" }
   | { type: "history-nav"; delta: number }
   | { type: "history-clear" }
-  | { type: "announce"; text: string };
+  | { type: "announce"; text: string }
+  | { type: "protection"; failed: boolean };
 
 /** Retire the live entry into history if it captured user work; discard an
  * attempt that captured nothing (whitespace-only counts as nothing). */
@@ -135,6 +147,7 @@ function reduce(state: State, action: Action): State {
         sessionId: action.sid,
         seconds: 0,
         rms: 0,
+        heardAudio: false,
       };
     }
     case "start-failed":
@@ -206,6 +219,8 @@ function reduce(state: State, action: Action): State {
       };
     case "announce":
       return { ...state, announcement: action.text };
+    case "protection":
+      return { ...state, protectionFailed: action.failed };
   }
 }
 
@@ -255,7 +270,7 @@ function reduceEvent(state: State, detail: AppEventDetail): State {
     }
     case "audio:level": {
       const rms = typeof detail.payload.rms === "number" ? detail.payload.rms : 0;
-      return { ...state, rms };
+      return { ...state, rms, heardAudio: state.heardAudio || rms > AUDIBLE_RMS };
     }
     case "session:autostopped":
       return { ...state, phase: "finalizing", capped: true };
@@ -345,6 +360,10 @@ export default function App() {
     const unsubscribe = subscribeAppEvents((detail) => {
       if (detail.name === "hotkey:toggle") {
         if (!stateRef.current.settingsOpen) onRecordToggleRef.current();
+        return;
+      }
+      if (detail.name === "protection:failed" || detail.name === "protection:ok") {
+        dispatch({ type: "protection", failed: detail.name === "protection:failed" });
         return;
       }
       const sid = detail.payload.sessionId;
@@ -521,6 +540,11 @@ export default function App() {
     state.phase === "recording" ||
     state.phase === "finalizing";
 
+  const silentSoFar =
+    state.phase === "recording" &&
+    !state.heardAudio &&
+    state.seconds >= SILENCE_HINT_AFTER_S;
+
   const canRegenerate =
     viewed !== null &&
     viewed.question.trim() !== "" &&
@@ -559,6 +583,13 @@ export default function App() {
         {status}
       </p>
 
+      {state.protectionFailed && (
+        <p className="protection-warning" role="alert">
+          Windows would not hide this window from screen capture, so it may be
+          visible if you share your screen.
+        </p>
+      )}
+
       <div className="record-row">
         <button
           ref={recordRef}
@@ -572,19 +603,23 @@ export default function App() {
       </div>
       {settings !== null && settings.hotkey !== "" && !hotkeyOn && (
         <p className="hotkey-taken">
-          {hotkeyLabel} is already taken by another app, so the shortcut is off —
-          record from this window, or pick a different one in Settings.
+          {settings.hotkeyStatus === "invalid" ? (
+            <>
+              {hotkeyLabel} isn't a shortcut Windows understands, so it's off —
+              try something like Ctrl+Shift+Space in Settings.
+            </>
+          ) : (
+            <>
+              {hotkeyLabel} is already taken by another app, so the shortcut is off —
+              record from this window, or pick a different one in Settings.
+            </>
+          )}
         </p>
       )}
 
       {state.phase === "recording" && (
         <div className="meter-row">
-          <div
-            className="level-meter"
-            role="img"
-            aria-label="Audio level"
-            data-testid="level-meter"
-          >
+          <div className="level-meter" aria-hidden="true" data-testid="level-meter">
             <div
               className="level-fill"
               style={{ width: `${Math.min(100, Math.round(state.rms * 140))}%` }}
@@ -592,6 +627,12 @@ export default function App() {
           </div>
           <span className="timer">{formatMmSs(state.seconds)}</span>
         </div>
+      )}
+      {silentSoFar && (
+        <p className="silence-hint" role="status">
+          No call audio detected yet — check that the call is playing through
+          your speakers, not a headset or another output device.
+        </p>
       )}
 
       <form

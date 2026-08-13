@@ -8,6 +8,7 @@ import {
   ok,
   settingsView,
   settle,
+  waitForSettings,
   type MockApi,
 } from "./testutils";
 
@@ -20,6 +21,7 @@ beforeEach(() => {
 async function renderApp() {
   render(<App />);
   await screen.findByText(/Ready — press Record/);
+  await waitForSettings();
 }
 
 async function openSettings() {
