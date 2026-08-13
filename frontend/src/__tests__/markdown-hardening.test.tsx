@@ -114,3 +114,27 @@ describe("block signature identity", () => {
     expect(blockSignature(a!)).not.toBe(blockSignature(b!));
   });
 });
+
+describe("emphasis resolution soundness", () => {
+  // The opener-floor optimization must never change what a document means.
+  // A failed `_` closer records a floor; a later `*` pair splices below it and
+  // shifts every index — a stale floor then hid real emphasis.
+  it("a * pair does not swallow later _ emphasis", () => {
+    const out = html("*the foo_ and bar_ conventions* use _trailing_ underscores");
+    expect(out).toContain("<em>trailing</em>");
+  });
+
+  it.each([
+    ["*a_ b_ c* then _d_", "<em>d</em>"],
+    ["**x_ y_ z** and _q_", "<em>q</em>"],
+    ["_a* b* c_ then *d*", "<em>d</em>"],
+  ])("keeps emphasis in %s", (source, expected) => {
+    expect(html(source)).toContain(expected);
+  });
+
+  it("still resolves ordinary mixed emphasis", () => {
+    expect(html("**bold** and *ital* and _under_")).toBe(
+      "<p><strong>bold</strong> and <em>ital</em> and <em>under</em></p>",
+    );
+  });
+});

@@ -114,10 +114,13 @@ an immutable request that the retry reuses as-is: "the retried request is
 byte-identical" is guaranteed by construction rather than by discipline.
 
 `wire.py` is the transport skeleton both providers share. Note the flag
-`response_started`: an httpx error before the response is "connect"
-(retryable), after it is "stream_drop" (not retryable — bytes may have
-been painted). One boolean is the whole difference between a safe retry
-and a double answer.
+`response_started`: an httpx error after the response started is
+"stream_drop" (never retryable — bytes may already have been painted).
+Before it, only a genuine connection failure (ConnectError,
+ConnectTimeout, PoolTimeout) is "connect", the sole retryable kind; a read
+timeout while waiting for response headers is "timeout", because the
+server may already be generating our answer and a retry would produce a
+second one.
 
 ## Stop 7: `app_core/llm/anthropic.py` and `groq.py` — two wire formats
 
@@ -218,8 +221,10 @@ thread boundary in the app.
   emission order. `evaluate_js` blocks, so the pump runs it in
   `asyncio.to_thread` — but one at a time, preserving order.
 - `hotkey.py`: Win32 `RegisterHotKey` on a dedicated message-loop thread
-  (the API is thread-bound). It returns an honest boolean — the UI's
-  "hotkey taken" notice depends on that honesty.
+  (the API is thread-bound). It returns an honest status —
+  registered / disabled / invalid / unavailable — so the UI can tell
+  "another app owns it" apart from "that isn't a shortcut Windows
+  understands".
 - `app.py`: crash logging (faulthandler + all three excepthooks), single
   instance (named mutex + named event to focus the first instance),
   content protection (`SetWindowDisplayAffinity(hwnd,

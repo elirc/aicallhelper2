@@ -136,8 +136,8 @@ policy, metrics, events, and views are provider-agnostic. To add one:
 ## Testing
 
 ```
-.venv\Scripts\python -m pytest tests -q      # 275 core tests
-cd frontend && npm test                       # 139 frontend tests
+.venv\Scripts\python -m pytest tests -q      # 288 core tests
+cd frontend && npm test                       # 146 frontend tests
 .venv\Scripts\python -m ruff check app_core app.py tests
 .venv\Scripts\python -m mypy                  # strict, on the core
 cd frontend && npm run typecheck              # TS strict
@@ -208,12 +208,21 @@ LLM.
   back, retries briefly, and — if the OS never confirms — shows a standing
   warning in the window. A user who believes they are hidden while being
   broadcast is this product's worst outcome, so it is not a log line.
-- **Silent-capture hint** (addition to §9's main view): after ~5 s of
-  recording with no audible frame, a line appears suggesting the call audio
-  may be going somewhere other than the speakers. Loopback capturing silence
-  — headset, wrong output device, muted call — is the most common real-world
-  failure, and otherwise the user only discovers it at Stop, after the
-  question is gone. It clears the instant audio arrives.
+- **Silent-capture hint** (addition to §9's main view): when no audible
+  frame has arrived for ~5 s of recording, a line appears suggesting the call
+  audio may be going somewhere other than the speakers. Loopback capturing
+  silence — headset, wrong output device, muted call — is the most common
+  real-world failure, and otherwise the user only discovers it at Stop, after
+  the question is gone. Because it tracks *when* audio was last heard rather
+  than whether it ever was, it also catches a device unplugged mid-question:
+  the capture stream stays bound to the dead endpoint and delivers silence
+  with no error. It clears the instant audio arrives.
+- **Audio is resampled with a phase-continuous, anti-aliased streaming
+  resampler** (`app_core/audio/downsample.py`). Resampling each device chunk
+  independently made the output depend on how the device sliced the stream,
+  dropped samples when a chunk did not divide evenly, and folded everything
+  above 8 kHz into the speech band. All three degraded exactly the audio
+  Deepgram transcribes.
 - **Hotkey failure is reported honestly**: the settings view carries a
   `hotkeyStatus` of `registered` / `disabled` / `invalid` / `unavailable`.
   The spec's "already taken by another app" copy is used only for

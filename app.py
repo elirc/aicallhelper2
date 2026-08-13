@@ -190,6 +190,8 @@ class App:
         self._current_accelerator: str | None = None
         self._affinity_api = Win32DisplayAffinity()
         self._protection_failed = False
+        self._protection_lock = threading.Lock()
+        self._protection_seq = 0
         self._entry_url = resolve_entry_url()
 
         self.http = httpx.AsyncClient(
@@ -269,6 +271,12 @@ class App:
         verified: a window the user believes is hidden while it is being
         broadcast is the worst outcome this app has, so a failure that
         survives the retries is reported to them rather than logged."""
+        # `shown` and `loaded` both trigger this, so attempts overlap. Stamp
+        # each one: a slow loser that finishes after a newer attempt already
+        # reported must not overwrite the fresher verdict with a stale one.
+        with self._protection_lock:
+            self._protection_seq += 1
+            attempt_id = self._protection_seq
         protected = False
         for attempt in range(CONTENT_PROTECTION_ATTEMPTS):
             if apply_content_protection(self._hwnd(), self._affinity_api):
@@ -276,7 +284,10 @@ class App:
                 break
             # The HWND may not be ready in the first instants after `shown`.
             time.sleep(CONTENT_PROTECTION_RETRY_S * (attempt + 1))
-        self._protection_failed = not protected
+        with self._protection_lock:
+            if attempt_id != self._protection_seq:
+                return  # superseded by a newer attempt; its verdict stands
+            self._protection_failed = not protected
         # Always emit, never only on transition: this also runs after a
         # renderer reload, where the page has lost the previous state.
         self._emit_from_thread("protection:ok" if protected else "protection:failed", {})
@@ -348,6 +359,23 @@ class App:
 
         threading.Thread(target=run, name="heartbeat-watchdog", daemon=True).start()
 
+    def _wire_window(self, window: Any) -> None:
+        """Adopt the window: attach the event sink, then subscribe callbacks.
+
+        The sink attach is load-bearing. Everything the core produces —
+        transcript, answer deltas, audio level, errors — reaches the page
+        only through it, and the pump parks on `while _window is None` until
+        it happens. Commands travel a separate channel (js_api), so without
+        this the app looks alive while showing nothing at all.
+        """
+        self.window = window
+        self.sink.attach(window)
+        window.events.shown += self._on_shown
+        window.events.loaded += self._on_loaded
+        window.events.moved += lambda *_a: self._schedule_bounds_save()
+        window.events.resized += lambda *_a: self._schedule_bounds_save()
+        window.events.closing += lambda *_a: self._on_closing()
+
     def run(self) -> None:
         import webview
 
@@ -368,20 +396,17 @@ class App:
         else:
             kwargs["width"], kwargs["height"] = DEFAULT_SIZE
 
-        self.window = webview.create_window(
-            WINDOW_TITLE,
-            url=self._entry_url,
-            js_api=self.api,
-            min_size=MIN_SIZE,
-            background_color=BACKGROUND,
-            on_top=bool(view.get("alwaysOnTop", True)),
-            **kwargs,
+        self._wire_window(
+            webview.create_window(
+                WINDOW_TITLE,
+                url=self._entry_url,
+                js_api=self.api,
+                min_size=MIN_SIZE,
+                background_color=BACKGROUND,
+                on_top=bool(view.get("alwaysOnTop", True)),
+                **kwargs,
+            )
         )
-        self.window.events.shown += self._on_shown
-        self.window.events.loaded += self._on_loaded
-        self.window.events.moved += lambda *_a: self._schedule_bounds_save()
-        self.window.events.resized += lambda *_a: self._schedule_bounds_save()
-        self.window.events.closing += lambda *_a: self._on_closing()
 
         watch_focus_signal(self._hwnd)
         accelerator = str(view.get("hotkey") or "")

@@ -148,8 +148,7 @@ function resolveEmphasis(tokens: Token[]): InlineNode[] {
   const work: Token[] = tokens.slice();
   // Lowest index that can still hold an opener, per delimiter char. Without
   // it, every closer that finds no opener re-scans the whole array, which is
-  // quadratic on delimiter-dense text. Splices only ever happen at or above
-  // the floor, so indices below it never shift and the floor stays valid.
+  // quadratic on delimiter-dense text.
   const openerFloor: Record<string, number> = { "*": 0, _: 0 };
   let resolved = 0;
   let closerIdx = 0;
@@ -204,6 +203,13 @@ function resolveEmphasis(tokens: Token[]): InlineNode[] {
     replacement.push({ t: "node", node, depth: childDepth + 1 });
     if (closer.count > 0) replacement.push(closer);
     work.splice(openerIdx, closerIdx - openerIdx + 1, ...replacement);
+    // A splice shifts every index above openerIdx, so any floor above it is
+    // now pointing at the wrong token. Floors at or below it are untouched.
+    // Skipping this let a `*` pair invalidate a stale `_` floor and silently
+    // swallow legitimate emphasis: "*the foo_ and bar_ x* use _trailing_ y".
+    for (const ch of ["*", "_"]) {
+      if ((openerFloor[ch] ?? 0) > openerIdx) openerFloor[ch] = openerIdx;
+    }
     closerIdx = openerIdx; // re-scan from the replacement site
   }
   return work.flatMap(tokenToNodes);

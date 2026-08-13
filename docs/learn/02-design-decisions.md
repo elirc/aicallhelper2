@@ -253,7 +253,11 @@ slow, they don't forgive lying dashboards."
 - **Pre-warm via `GET /v1/models`**: unauthenticated, throttled, body read
   to completion so the connection returns to the pool. The point is the
   TLS handshake happening BEFORE the stop-to-first-word window.
-- **One serialized event queue to the webview**: `evaluate_js` per event,
-  pumped one at a time. Out-of-order `llm:delta` events would scramble the
-  answer text; ordering is a correctness property, so it's structural, not
-  incidental.
+- **One serialized event queue to the webview**: the pump drains whatever
+  is queued into a single `evaluate_js` batch (capped at 64), one batch at a
+  time, order preserved — each call is a blocking round trip on a worker
+  thread and an answer streams dozens of deltas per second. Out-of-order
+  `llm:delta` events would scramble the answer text; ordering is a
+  correctness property, so it's structural, not incidental. A batch that
+  fails is retried event by event, because losing a terminal `llm:done`
+  would strand the UI in "Generating answer…".

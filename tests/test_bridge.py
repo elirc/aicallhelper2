@@ -235,18 +235,62 @@ class TestEventSink:
             await asyncio.sleep(0.02)
         assert all_details(window.scripts)[0]["payload"]["text"] == "early"
 
-    async def test_a_throwing_webview_does_not_kill_the_pump(self) -> None:
+    async def test_a_transient_dispatch_failure_loses_nothing(self) -> None:
+        # A failed batch is retried event by event, so a momentary webview
+        # hiccup no longer costs the whole batch — losing a terminal
+        # llm:done would strand the UI in "Generating answer..." forever.
         sink = WebviewEventSink()
         window = FakeWindow(fail_first=True)
         sink.attach(window)
         sink.start()
-        sink.emit("a", {"n": 1})  # this dispatch raises
-        await asyncio.sleep(0.15)
-        sink.emit("b", {"n": 2})  # the pump must still be alive for this one
-        deadline = asyncio.get_running_loop().time() + 2.0
-        while not window.scripts and asyncio.get_running_loop().time() < deadline:
+        sink.emit("a", {"n": 1})
+        sink.emit("b", {"n": 2})
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            len(all_details(window.scripts)) < 2
+            and asyncio.get_running_loop().time() < deadline
+        ):
             await asyncio.sleep(0.02)
-        assert [d["name"] for d in all_details(window.scripts)] == ["b"]
+        assert [d["name"] for d in all_details(window.scripts)] == ["a", "b"]
+
+    async def test_one_poison_event_cannot_take_its_neighbours_down(self) -> None:
+        # An unserializable payload used to kill the pump task outright
+        # (json.dumps ran outside the guard); now it costs only itself.
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        sink.emit("llm:delta", {"sessionId": "s1", "delta": "before"})
+        sink.emit("bad", {"sessionId": "s1", "obj": object()})  # not JSON
+        sink.emit("llm:done", {"sessionId": "s1", "answer": "after"})
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            len(all_details(window.scripts)) < 2
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        names = [d["name"] for d in all_details(window.scripts)]
+        assert names == ["llm:delta", "llm:done"]  # the terminal event survived
+
+    async def test_non_finite_numbers_do_not_produce_invalid_json(self) -> None:
+        # JSON.parse rejects NaN/Infinity, so a batch containing one would be
+        # dropped wholesale by the page.
+        sink = WebviewEventSink()
+        window = FakeWindow()
+        sink.attach(window)
+        sink.start()
+        sink.emit("audio:level", {"sessionId": "s1", "rms": float("nan")})
+        sink.emit("audio:level", {"sessionId": "s1", "rms": 0.5})
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            not all_details(window.scripts)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        details = all_details(window.scripts)
+        assert [d["payload"]["rms"] for d in details] == [0.5]
+        for code in window.scripts:
+            assert "NaN" not in code
 
 
 class TestEventBatching:

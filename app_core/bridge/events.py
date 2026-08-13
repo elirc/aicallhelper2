@@ -10,7 +10,6 @@ a time, preserving order.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from typing import Any
 
@@ -50,18 +49,37 @@ class WebviewEventSink:
                     batch.append(self._queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            if await self._dispatch(batch):
+                continue
+            # The batch failed as a unit. Retry event by event so one
+            # unserializable or oversized payload cannot take its 63
+            # neighbours with it — a lost llm:done would strand the UI in
+            # "Generating answer…" forever.
+            for event in batch:
+                await self._dispatch([event])
+
+    async def _dispatch(self, batch: list[tuple[str, dict[str, object]]]) -> bool:
+        """Send one batch. False means it failed as a unit and is worth
+        splitting; a single-event batch that fails is simply lost."""
+        try:
             details = json.dumps(
                 [{"name": name, "payload": payload} for name, payload in batch],
                 ensure_ascii=False,
+                allow_nan=False,  # NaN/Infinity are not JSON; JSON.parse rejects them
             )
-            # Double-encode so arbitrary payload text (quotes, backslashes,
-            # newlines, U+2028) survives the trip through evaluate_js as a JS
-            # string: the outer dump escapes every non-ASCII character.
-            code = (
-                f"JSON.parse({json.dumps(details)}).forEach("
-                "function(d){window.dispatchEvent("
-                "new CustomEvent('app:event',{detail:d}))})"
-            )
+        except Exception:
+            return False  # serialization is per-batch, so isolate the culprit
+        # Double-encode so arbitrary payload text (quotes, backslashes,
+        # newlines, U+2028) survives the trip through evaluate_js as a JS
+        # string: the outer dump escapes every non-ASCII character.
+        code = (
+            f"JSON.parse({json.dumps(details)}).forEach("
+            "function(d){window.dispatchEvent("
+            "new CustomEvent('app:event',{detail:d}))})"
+        )
+        try:
+            await asyncio.to_thread(self._window.evaluate_js, code)
+        except Exception:
             # A dying webview must not kill the core loop.
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(self._window.evaluate_js, code)
+            return False
+        return True

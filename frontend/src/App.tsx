@@ -38,10 +38,12 @@ interface State {
   view: number;
   error: AppErrorPayload | null;
   rms: number;
-  /** Any audible frame since this recording began (loopback silence is the
-   *  single most common real-world failure: audio routed to a headset, the
-   *  wrong output device, or a muted call). */
-  heardAudio: boolean;
+  /** Recording second at which audio was last heard, or null if never.
+   *  Loopback silence is the most common real-world failure (audio routed to
+   *  a headset, the wrong output device, a muted call) and it can also start
+   *  mid-recording when a device is unplugged or Windows switches the default
+   *  output — tracking WHEN, not merely whether, catches both. */
+  heardAudioAt: number | null;
   protectionFailed: boolean;
   seconds: number;
   capped: boolean;
@@ -64,7 +66,7 @@ const initialState: State = {
   view: 0,
   error: null,
   rms: 0,
-  heardAudio: false,
+  heardAudioAt: null,
   protectionFailed: false,
   seconds: 0,
   capped: false,
@@ -147,7 +149,7 @@ function reduce(state: State, action: Action): State {
         sessionId: action.sid,
         seconds: 0,
         rms: 0,
-        heardAudio: false,
+        heardAudioAt: null,
       };
     }
     case "start-failed":
@@ -270,7 +272,11 @@ function reduceEvent(state: State, detail: AppEventDetail): State {
     }
     case "audio:level": {
       const rms = typeof detail.payload.rms === "number" ? detail.payload.rms : 0;
-      return { ...state, rms, heardAudio: state.heardAudio || rms > AUDIBLE_RMS };
+      return {
+        ...state,
+        rms,
+        heardAudioAt: rms > AUDIBLE_RMS ? state.seconds : state.heardAudioAt,
+      };
     }
     case "session:autostopped":
       return { ...state, phase: "finalizing", capped: true };
@@ -540,10 +546,11 @@ export default function App() {
     state.phase === "recording" ||
     state.phase === "finalizing";
 
+  // Fires both when nothing was ever heard and when audio stops for a
+  // stretch, which is what a device dying mid-recording looks like.
   const silentSoFar =
     state.phase === "recording" &&
-    !state.heardAudio &&
-    state.seconds >= SILENCE_HINT_AFTER_S;
+    state.seconds - (state.heardAudioAt ?? 0) >= SILENCE_HINT_AFTER_S;
 
   const canRegenerate =
     viewed !== null &&

@@ -103,7 +103,15 @@ def parse_accelerator(accelerator: str) -> ParsedAccelerator | None:
             vk = _NAMED_KEYS.get(part, ord(part.upper()))
         elif part in _NAMED_KEYS:
             vk = _NAMED_KEYS[part]
-        elif part.startswith("f") and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
+        elif (
+            part.startswith("f")
+            and part[1:].isascii()
+            and part[1:].isdecimal()
+            and 1 <= int(part[1:]) <= 24
+        ):
+            # isascii() before isdecimal(): str.isdigit()/isdecimal() accept
+            # superscripts and other numerals that int() then rejects, so
+            # "f²" used to raise ValueError out of a never-raise parser.
             vk = 0x70 + int(part[1:]) - 1
         else:
             return None

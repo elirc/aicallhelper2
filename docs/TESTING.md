@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (275 tests)
-cd frontend && npm test                        # frontend (139 tests)
+.venv\Scripts\python -m pytest tests -q        # core (288 tests)
+cd frontend && npm test                        # frontend (146 tests)
 ```
 
 ---
@@ -902,3 +902,83 @@ The invariant corpus was six documents, longest 78 characters. It now also
 includes CRLF documents (so a cut between `\r` and `\n` is exercised), mixed
 line endings, nested and adjacent emphasis, a control character inside list
 item text, and a ~500-character realistic answer — every cut point of each.
+
+---
+
+## Second audit pass (2026-08-13, 14 agents)
+
+### tests/test_app_wiring.py — the shell↔core seam
+
+The seam nothing owned. Core tests use a fake event sink, bridge tests attach
+a fake window themselves, frontend tests dispatch events by hand — so the one
+line joining them was untested, and it was **missing for four commits**. The
+shipped app accepted Record/Stop/Ask (js_api is its own channel) while the
+event pump parked forever on `while self._window is None`: no transcript, no
+answer, no level meter, no errors.
+
+- **test_wiring_attaches_the_event_sink** — `_wire_window` attaches the sink.
+  Verified to fail when the attach is removed.
+- **test_wiring_subscribes_every_window_callback** — shown/loaded (content
+  protection), moved/resized (debounced geometry), closing (geometry flush).
+- **test_an_emitted_event_actually_reaches_the_window** — end to end across
+  the seam: `sink.emit` → pump → `window.evaluate_js`, asserting the payload
+  and the `app:event` name actually arrive.
+
+### tests/test_bridge.py — batch failure isolation
+
+- **test_a_transient_dispatch_failure_loses_nothing** (replaces the old
+  "batch is lost" assertion) — a failed batch is retried event by event, so a
+  momentary webview hiccup no longer costs up to 64 events. Batching had
+  amplified the blast radius 64×, and a lost `llm:done` strands the UI in
+  "Generating answer…" forever.
+- **test_one_poison_event_cannot_take_its_neighbours_down** — serialization
+  now happens per batch inside the guard; an unserializable payload used to
+  kill the pump task outright, silencing the app for the rest of the session.
+- **test_non_finite_numbers_do_not_produce_invalid_json** — `allow_nan=False`
+  because `JSON.parse` rejects `NaN`/`Infinity`, which would drop the batch
+  at the page instead of at the pump.
+
+### tests/test_downsample.py::TestStreamingResampler — the audio Deepgram hears
+
+Resampling each device chunk standalone was wrong three ways, all measured:
+
+- **test_output_is_independent_of_how_the_device_chunks_the_audio** — the old
+  code pinned both endpoints of every chunk, so output depended on how the
+  device happened to slice the stream (up to **2.0** of waveform error on a
+  unit-amplitude 1 kHz sine). Now byte-identical across chunk sizes 480 /
+  1024 / 6000 / 7777.
+- **test_no_samples_are_lost_over_a_long_stream** — a chunk length that did
+  not divide evenly silently dropped audio (**15 985** samples where 16 000
+  were owed, per second).
+- **test_content_above_the_target_nyquist_is_filtered_not_folded** — 48 kHz →
+  16 kHz with no low-pass folds everything above 8 kHz into the speech band;
+  a 10 kHz tone arrived at near-full strength around 6 kHz. Now **~59 dB**
+  suppressed.
+- **test_speech_band_content_passes_through_intact** — 300/1000/3000 Hz
+  preserved to <1%, so the filter buys alias rejection without dulling
+  speech.
+- **test_a_44100_device_also_resamples_without_drift** — not every device is
+  48 kHz.
+- **test_empty_and_tiny_chunks_are_safe / test_cost_stays_negligible_on_the_
+  callback_thread** — this runs inside the GIL on PortAudio's thread; 125 ms
+  of audio must cost a small fraction of 125 ms (measured ~1.5%).
+- **test_downsample_chunk_threads_the_resampler_through** — the same input
+  twice through one resampler is deliberately NOT identical output; it
+  continues the phase and filter state rather than restarting.
+
+### tests/test_hotkey.py + frontend
+
+- **parse_accelerator** now rejects `f²`, `f①` and friends: `str.isdigit()`
+  is true for 128 codepoints `int()` rejects, so the never-raise parser
+  raised `ValueError`.
+- **markdown-hardening.test.tsx::emphasis resolution soundness (5 tests)** —
+  the opener-floor speedup went stale across delimiter characters: a failed
+  `_` closer recorded a floor, then a `*` splice shifted every index past it
+  and real emphasis silently vanished ("*the foo_ and bar_ conventions* use
+  _trailing_ underscores" lost its `<em>`). Floors above a splice are now
+  invalidated.
+- **app-signals.test.tsx::audio that stops mid-recording (2 tests)** — the
+  silence hint tracks *when* audio was last heard rather than *whether* it
+  ever was, so a device unplugged mid-question (or Windows switching the
+  default output, which leaves the stream bound to a dead endpoint) now
+  warns instead of recording silence to the end.

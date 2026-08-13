@@ -64,13 +64,17 @@ describe("silent-capture hint", () => {
     expect(screen.queryByText(SILENCE_HINT)).toBeNull();
   });
 
-  it("never appears once any audible frame arrived", async () => {
+  it("stays quiet while audible frames keep arriving", async () => {
+    // The hint tracks how long since audio was last heard, not whether it was
+    // ever heard, so a live call must keep it suppressed indefinitely.
     await renderApp();
     await startRecording();
-    emit("audio:level", { sessionId: "s1", rms: 0.2 });
-    act(() => {
-      vi.advanceTimersByTime(9000);
-    });
+    for (let i = 0; i < 9; i += 1) {
+      emit("audio:level", { sessionId: "s1", rms: 0.2 });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+    }
     expect(screen.queryByText(SILENCE_HINT)).toBeNull();
   });
 
@@ -212,5 +216,41 @@ describe("level meter accessibility", () => {
     await renderApp();
     await startRecording();
     expect(screen.getByTestId("level-meter")).toHaveAttribute("aria-hidden", "true");
+  });
+});
+
+describe("audio that stops mid-recording", () => {
+  // A device unplugged mid-question, or Windows switching the default output,
+  // leaves the stream bound to a dead endpoint: frames keep arriving as pure
+  // silence. Tracking only "was anything ever heard" would stay quiet.
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  it("warns when audio was flowing and then stopped", async () => {
+    await renderApp();
+    await startRecording();
+    emit("audio:level", { sessionId: "s1", rms: 0.2 });
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.queryByText(SILENCE_HINT)).toBeNull(); // still fine
+    emit("audio:level", { sessionId: "s1", rms: 0.0 });
+    act(() => {
+      vi.advanceTimersByTime(7000);
+    });
+    expect(screen.getByText(SILENCE_HINT)).toBeInTheDocument();
+  });
+
+  it("keeps quiet while audio keeps arriving", async () => {
+    await renderApp();
+    await startRecording();
+    for (let i = 0; i < 10; i += 1) {
+      emit("audio:level", { sessionId: "s1", rms: 0.2 });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+    }
+    expect(screen.queryByText(SILENCE_HINT)).toBeNull();
   });
 });
