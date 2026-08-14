@@ -46,9 +46,10 @@ hot path, inside the GIL.
 Server-Sent Events look trivial ("lines starting with `data:`") and are a
 minefield: chunks split anywhere (including between `\r` and `\n`, and in
 the middle of a multi-byte UTF-8 character), three line-ending styles,
-comment lines, and — the killer — a final `data:` line with no trailing
-newline when the stream is truncated. Losing that line loses the answer's
-last words, silently.
+comment lines, a leading BOM that would fuse onto the first field name and
+silently drop the stream's first event, and — the killer — a final `data:`
+line with no trailing newline when the stream is truncated. Losing that
+line loses the answer's last words, silently.
 
 **Look closely** at `_pending_cr`. When a chunk ends in `\r`, the parser
 has already dispatched the line but must remember to swallow a leading
@@ -56,8 +57,8 @@ has already dispatched the line but must remember to swallow a leading
 an empty line, and an empty line means "dispatch the event", so the event
 dispatches twice. This is exactly the kind of bug that only appears in
 production under real network chunking, which is why
-`tests/test_sse.py::test_every_cut_point_matches_batch` brute-forces every
-split point.
+`tests/test_sse.py::TestHostileChunking::test_every_cut_point_matches_batch`
+brute-forces every split point.
 
 Also notice: the parser owns an *incremental* UTF-8 decoder
 (`codecs.getincrementaldecoder`). Decoding chunk-by-chunk with `.decode()`
@@ -84,10 +85,15 @@ Three files, three lessons:
 - `settings.py`: **per-field fallback**. The settings file is
   user-writable, so it's untrusted input. One corrupt field falls back
   alone; the user's resume survives someone hand-editing the JSON badly.
-  Also atomic writes: `tmp` + `os.replace`, and — subtle — the in-memory
-  cache updates only AFTER the write lands. If memory ran ahead of disk, a
-  failed write followed by a successful one would silently commit the
-  failed change.
+  Also atomic writes: a per-writer tmp name + `os.replace`, and — subtle —
+  the in-memory cache updates only AFTER the write lands. If memory ran
+  ahead of disk, a failed write followed by a successful one would
+  silently commit the failed change. Notice the `threading.RLock` around
+  every write: writers arrive on different threads (a settings patch via
+  `asyncio.to_thread`, window bounds from a debounce timer and the close
+  handler), and an unlocked read-modify-write of the whole dict would let
+  one writer's fields — a just-saved API key, or the resume — vanish from
+  both disk and the cache.
 - `secrets.py`: keys are DPAPI-encrypted with prefix-tagged storage
   (`enc:` / `plain:`). Decode by STORED prefix, never by current keystore
   availability. Everything unreadable "reads as unset" — fail closed; a
@@ -106,12 +112,13 @@ settings validation AND the Settings UI's `<select>`, so "add a provider"
 is one module + one `register()` call. This seam is a product requirement,
 not tidiness — read README "How to add an answer provider".
 
-`retry.py` is 30 lines that encode four hard rules: retry exactly once;
-only for connection-level failure; never after an HTTP status (the server
-heard us); never after a delta reached the UI (a second attempt would
-concatenate two answers). **Look closely** at why `build_request` returns
-an immutable request that the retry reuses as-is: "the retried request is
-byte-identical" is guaranteed by construction rather than by discipline.
+`retry.py` is one function of about thirty lines that encodes four hard
+rules: retry exactly once; only for connection-level failure; never after
+an HTTP status (the server heard us); never after a delta reached the UI
+(a second attempt would concatenate two answers). **Look closely** at why
+`build_request` returns an immutable request that the retry reuses as-is:
+"the retried request is byte-identical" is guaranteed by construction
+rather than by discipline.
 
 `wire.py` is the transport skeleton both providers share. Note the flag
 `response_started`: an httpx error after the response started is
@@ -129,8 +136,8 @@ only (see Stop 4). Groq: one joined system string, plus
 `reasoning_effort: "low"` and `include_reasoning: false` — gpt-oss is a
 reasoning model, and reasoning tokens are pure delay before the first
 spoken word. Groq's module deliberately exports its helpers
-(`extract_openai_delta`, `classify_openai_failure`): it doubles as the
-template for any future OpenAI-compatible provider.
+(`extract_openai_delta`, `is_done_sentinel`, `classify_openai_failure`):
+it doubles as the template for any future OpenAI-compatible provider.
 
 **Look closely** at Groq's `[DONE]` handling: it `continue`s — a sentinel
 to skip, NOT a stream terminator. Treating it as EOF would drop any bytes
@@ -138,10 +145,11 @@ after it in the same chunk.
 
 ## Stop 8: `app_core/session/machine.py` — the crown jewels
 
-Read §5 of the spec (mirrored in comments) first, then the file. The core
-shape: at most ONE live session; commands (`start_session`, `stop_session`,
-`ask`, `cancel_session`) run on the asyncio loop; every session mutation
-happens there and only there.
+Read the numbered rule comments (they mirror §5 of the spec, which lives
+outside this repo) first, then the file. The core shape: at most ONE live
+session; commands (`start_session`, `stop_session`, `ask`,
+`cancel_session`) run on the asyncio loop; every session mutation happens
+there and only there.
 
 The invariants worth tracing by hand:
 
@@ -150,16 +158,28 @@ The invariants worth tracing by hand:
    event emission checks `aborted` — so events from a dead session,
    *including its `llm:done`*, drop. And the socket death the abort causes
    is suppressed, not reported.
-2. **Latest-start-wins**: `self._active = session` happens synchronously
-   BEFORE the connect await. A second Record press supersedes the first
-   *while it is still connecting*; when the loser's connect resolves, it
-   checks `self._active is not session` and tears itself down silently.
-   Race bugs like this can't be fixed after the await — the claim must
-   precede it.
+2. **Latest-start-wins**, twice over. `self._active = session` happens
+   synchronously BEFORE the connect await: a second Record press
+   supersedes the first *while it is still connecting*, and when the
+   loser's connect resolves it checks `self._active is not session` and
+   tears itself down silently. But `start_session` and `ask` also await
+   DPAPI key reads BEFORE any session exists, so a second claim guards
+   that window: `_claim_ticket()` runs synchronously at command entry,
+   and `_require_ticket()` after the awaits refuses a command that a
+   newer one has overtaken. Without the ticket, a Record press whose
+   DPAPI read stalled could resume and supersede an Ask the user issued
+   LATER — the older command would win. Race bugs like these can't be
+   fixed after the await; the claim must precede it.
 3. **The stop contract**: `stop_session` returns took/not-took as an error
    Result, because every other outcome is an event. A stop that silently
-   did nothing leaves the UI in "Finalizing…" forever — the return value
-   is the ONLY way it learns.
+   did nothing leaves the UI in "Finalizing transcript…" forever — the
+   return value is the ONLY way it learns. Note what "not taken" does NOT
+   mean: the session may be alive and mid-finalize, because the 120 s cap
+   auto-stops on its own (`_on_record_cap` → `session:autostopped` →
+   `_begin_stop`), and a user Stop racing that cap is refused —
+   `stop_requested` is already set. How the frontend must react to a
+   refusal is Stop 13's story; treating it as "session is gone" destroyed
+   the answer that was still coming.
 4. **Timeout interplay** (`_answer`): two watchdog tasks; the first-token
    watchdog checks a closure over `first_token_ms`; both set
    `session.errored = True` *before* cancelling the stream so that a delta
@@ -186,7 +206,7 @@ Map each piece to a wire reality:
   Without this, the first words of the question are clipped.
 - KeepAlive every 8 s: Deepgram kills sockets ~10 s after the last audio,
   and silence during a call is normal. But the keepalive checks
-  `close_requested` immediately before sending: a KeepAlive after
+  `_close_requested` immediately before sending: a KeepAlive after
   CloseStream errors on the CLOSING socket and fabricates a "lost
   connection" during a stop that is *succeeding*.
 - Finalize: send CloseStream, wait for the server's flush-and-close (5 s
@@ -199,40 +219,118 @@ Map each piece to a wire reality:
   recording death (one `stt_error`, because a silently truncated
   transcript answers the wrong question).
 
+**Look closely** at `_CLOSE_SENTINEL`. CloseStream is not sent directly —
+it is queued on the SAME asyncio queue the audio frames travel, so it can
+never overtake frames still parked behind a stalled send. Deepgram
+discards audio that arrives after CloseStream; letting the close jump the
+queue would silently truncate the transcript's tail. A test for this
+ordering once passed only because its fake socket drained synchronously —
+`TestCloseStreamUnderBackpressure` in `tests/test_deepgram_client.py` now
+stalls the sender to prove the sentinel really waits its turn.
+
 ## Stop 10: `app_core/audio/` — the only non-async thread work
 
-`downsample.py` is pure numpy (vectorized; per-sample Python loops on the
-audio path would burn CPU inside the GIL on PortAudio's thread).
 `capture.py` runs the device callback on PortAudio's thread and does the
-minimum — convert, resample, accumulate 2048-sample frames — then hands
-off with `loop.call_soon_threadsafe`. That call is the ONLY legal doorway
-from a foreign thread into the loop; grep the repo for
-`call_soon_threadsafe` / `run_coroutine_threadsafe` and you'll find every
-thread boundary in the app.
+minimum — convert, resample, accumulate 2048-sample frames (~128 ms at
+16 kHz) — then hands off with `loop.call_soon_threadsafe`. That call is
+the ONLY legal doorway from a foreign thread into the loop; grep the repo
+for `call_soon_threadsafe` / `run_coroutine_threadsafe` and you'll find
+every thread boundary in the app. Note the blanket `except Exception` in
+`_on_device_chunk`: an exception escaping into PortAudio's C callback
+kills the stream with no Python-visible error — the user would just see a
+recording that captures nothing — so a bad chunk is dropped instead.
 
-## Stop 11: `app_core/bridge/` + `app.py` — the shell
+`downsample.py` is pure numpy (vectorized; per-sample Python loops on the
+audio path would burn CPU inside the GIL on PortAudio's thread). Its
+centerpiece is `StreamingResampler`, which replaced a resampler that
+processed each device chunk standalone — wrong in three MEASURED ways:
+the output depended on how the device happened to slice the audio (up to
+2.0 of waveform error on a unit-amplitude sine), samples were dropped
+whenever a chunk length didn't divide evenly (15,985 delivered where
+16,000 were owed, per second), and decimating 48 kHz → 16 kHz with no
+low-pass folded everything above 8 kHz back into the speech band (a
+10 kHz tone arrived near full strength at ~6 kHz). All three landed on
+the audio Deepgram transcribes. `docs/learn/09-audio-and-dsp.md` teaches
+the DSP behind each failure from zero.
+
+**Look closely** at the two pieces of state the fix carries across
+chunks: `_fir_state`, the overlap-save tail of a 63-tap windowed-sinc
+low-pass (~59 dB of alias suppression for ~1.5% of real time on the
+callback thread), and `_pos`, the FRACTIONAL read position. Carrying the
+fraction — not just the leftover samples — keeps consecutive chunks on
+one continuous time base: feeding a signal through in ANY chunk sizes
+produces byte-identical output to feeding it whole, and
+`tests/test_downsample.py` asserts exactly that. `capture.py` holds one
+resampler per stream for the same reason: the state is per-stream, never
+per-chunk.
+
+## Stop 11: `app_core/bridge/` — four doorways, each with a contract
 
 - `api.py`: pywebview calls js_api methods on worker threads. Every
-  handler wraps a coroutine with `run_coroutine_threadsafe(...).result()`
-  — the worker thread blocks, the loop does the work, session state is
-  never touched off-loop. Every command returns a Result envelope; nothing
-  throws across the language boundary.
+  handler that touches the core hands off to the loop — the session
+  commands wrap a coroutine with `run_coroutine_threadsafe(...).result()`,
+  so the worker thread blocks, the loop does the work, and session state
+  is never touched off-loop (`cancel_session` is the deliberate exception:
+  fire-and-forget via `call_soon_threadsafe`). Every command returns a
+  Result envelope; nothing throws across the language boundary.
 - `events.py`: ONE queue, ONE pump task → events reach the DOM in
   emission order. `evaluate_js` blocks, so the pump runs it in
-  `asyncio.to_thread` — but one at a time, preserving order.
+  `asyncio.to_thread` — one *batch* at a time. The pump drains whatever
+  is queued into a single `evaluate_js` call (capped at 64): each call is
+  a blocking round trip on a worker thread and an answer streams dozens
+  of deltas per second, so per-event round trips would eat the latency
+  budget. If a batch fails as a unit, it retries event by event — one
+  unserializable payload must not take its 63 neighbours with it, because
+  a lost `llm:done` strands the UI in "Generating answer…" forever.
 - `hotkey.py`: Win32 `RegisterHotKey` on a dedicated message-loop thread
   (the API is thread-bound). It returns an honest status —
   registered / disabled / invalid / unavailable — so the UI can tell
   "another app owns it" apart from "that isn't a shortcut Windows
   understands".
-- `app.py`: crash logging (faulthandler + all three excepthooks), single
-  instance (named mutex + named event to focus the first instance),
-  content protection (`SetWindowDisplayAffinity(hwnd,
-  WDA_EXCLUDEFROMCAPTURE)` — re-applied on every load), debounced
-  geometry saves flushed on close, and a heartbeat watchdog that reloads a
-  dead WebView2 renderer at most once per 10 s.
+- `protection.py`: content protection, VERIFIED. Invisibility to screen
+  sharing is the product's moat feature, and `SetWindowDisplayAffinity`
+  returns a BOOL that is easy to ignore — and it CAN fail (an HWND that
+  isn't ready yet, policy, Windows builds older than 2004 which lack
+  `WDA_EXCLUDEFROMCAPTURE`). So `apply_content_protection` applies, then
+  reads the affinity back with `GetWindowDisplayAffinity` and returns
+  True ONLY when the OS confirms it. **Look closely** at the docstring's
+  framing: a False here is a user-visible fact, not a log line — a user
+  who believes they are hidden while being broadcast is this product's
+  worst outcome. The real user32 calls live behind a two-method Protocol
+  (`DisplayAffinityApi`), which is what lets `tests/test_protection.py`
+  exercise every failure path without a window.
 
-## Stop 12: the frontend (`frontend/src/`)
+## Stop 12: `app.py` — the shell, and the seam that was missing
+
+The shell's duties: crash logging (faulthandler plus all three exception
+hooks — `sys.excepthook`, `threading.excepthook`, and the asyncio loop's
+exception handler), single instance (named mutex + named event to focus
+the first instance), window-geometry persistence (debounced on
+move/resize, flushed on close, and `plausible_bounds` refuses the
+(-32000, -32000) titlebar-sized rect a minimized window reports), a
+heartbeat watchdog that reloads a dead WebView2 renderer at most once per
+10 s, and content protection retried across the first instants after
+`shown` — with each attempt stamped by a sequence number so a slow loser
+that finishes after a newer attempt cannot overwrite the fresher verdict
+with a stale one (`_apply_content_protection`).
+
+**Look closely** at `_wire_window`, and memorize it. It is five
+subscriptions and one line — `self.sink.attach(window)` — and that line
+was missing for FOUR commits. The event pump parks on
+`while self._window is None`, so nothing the core emitted reached the
+page: no transcript, no answer deltas, no audio level, no errors. And the
+app still LOOKED alive, because commands travel a separate channel —
+`js_api` is handed to `create_window` directly — so buttons responded
+while the window showed nothing at all. Every suite was green the whole
+time, because each side mocked the other: core tests used a fake sink,
+bridge tests attached a fake window themselves, frontend tests dispatched
+events by hand. The one line connecting them was the one line nothing
+tested. `tests/test_app_wiring.py` now walks the real seam — it
+instantiates the real `App`, wires a stub window, and asserts an emitted
+event lands in `evaluate_js`. The lesson generalizes: integration points
+where every test mocks the other side are exactly where green suites lie.
+
+## Stop 13: the frontend (`frontend/src/`)
 
 - `bridge.ts`: the typed doorway; every command resolves a Result.
 - `App.tsx`: a reducer-based mirror of the core state machine
@@ -244,17 +342,35 @@ thread boundary in the app.
   is discarded, but one with a question or partial answer is retired into
   history, because the transcript is user work and a vanishing
   half-answer looks like data loss.
+- `doStop` and `stopStranded`: the completion of Stop 8's stop contract.
+  A refused stop used to be treated as "session is gone", and the UI
+  cancelled it — but a Stop press racing the 120 s cap is refused
+  precisely BECAUSE the session is alive and finalizing, so the cancel
+  destroyed the answer to a question the user had just spent two minutes
+  asking. Now a refusal keeps waiting for the terminal event, with a
+  20 s bounded recovery (`STOP_RECOVERY_MS`) for the case where the
+  session really is gone — neither stuck finalizing forever nor a live
+  session killed.
 - `markdown/`: the security-critical renderer. Links are NOT parsed — no
   href exists, so there is nothing to sanitize. Every string is a React
   text node; the streaming invariant (every prefix renders identically to
   the batch render) is enforced by the parser being a pure function of the
-  full source. Read the XSS test suite to see what it's defending against.
+  full source. Emphasis nesting is capped (24 deep, 1000 pairs, and
+  resolution is skipped entirely past 20,000 characters) because model
+  output is untrusted and unbounded nesting overflowed the render stack —
+  and React unmounts the whole root on an uncaught render error, which
+  turns a weird answer into a blank app. `MarkdownBoundary` falls back to
+  plain text if rendering ever throws anyway. Read the hardening test
+  suite to see what all of this is defending against.
 
 ## After the tour
 
 You should now be able to answer, without looking: (1) why claiming
-`self._active` must happen before the connect await; (2) why a KeepAlive
+`self._active` must happen before the connect await — and why that alone
+wasn't enough once commands awaited DPAPI reads; (2) why a KeepAlive
 after CloseStream is a bug; (3) why retry-after-first-delta is forbidden;
-(4) why the prompt must be byte-stable; (5) why links aren't parsed. If
-any of those is fuzzy, that's your re-read list — then go to
+(4) why the prompt must be byte-stable; (5) why links aren't parsed;
+(6) why a refused stop must NOT cancel the session; (7) why
+`sink.attach(window)` is the most important line in `app.py`. If any of
+those is fuzzy, that's your re-read list — then go to
 [02-design-decisions.md](02-design-decisions.md).

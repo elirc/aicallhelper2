@@ -767,8 +767,10 @@ each of these tests exists because a specific one of them shipped.
   keys also mapped to unassigned Win32 VK codes.
 - **test_settings.py::TestConcurrentWriters::test_a_bounds_save_racing_a_patch_never_loses_either_writer**
   — drag the window, then click Save within half a second: the unsynchronized
-  read-modify-write dropped one writer's fields from disk AND cache. Also
-  **test_no_stray_tmp_files_are_left_behind** (per-writer tmp names).
+  read-modify-write dropped one writer's fields from disk AND cache.
+  **test_no_stray_tmp_files_are_left_behind** pins the visible half — no tmp
+  file survives a write — but nothing asserts the two writers get distinct
+  names, so that half rests on the lock test above.
 - **TestKeyCharsetValidation (2 tests)** — a key with a smart quote reached
   httpx and raised UnicodeEncodeError mid-answer, surfacing as "internal
   error"; it is now refused at save time with a message naming the cause.

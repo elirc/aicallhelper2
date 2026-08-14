@@ -136,7 +136,11 @@ describe("streaming invariant", () => {
     ["## Summary", "", ...Array.from({ length: 12 }, (_, i) => `- point ${i} with **bold** and \`code\``), "", "Closing *thought* here."].join("\n"),
   ];
 
-  it("every cut point renders identically to a batch render", () => {
+  // Renders every prefix of an eleven-document corpus twice. It is the most
+  // expensive test in the suite by an order of magnitude and it earns that,
+  // so give it room rather than thinning the corpus: the 30 s default was
+  // occasionally exceeded when all eleven files run in parallel.
+  it("every cut point renders identically to a batch render", { timeout: 180_000 }, () => {
     // One reused root: prefix -> full -> compare, for EVERY cut point.
     for (const doc of corpus) {
       const batch = html(doc);
@@ -150,7 +154,7 @@ describe("streaming invariant", () => {
     }
   });
 
-  it("rendering any prefix never throws", () => {
+  it("rendering any prefix never throws", { timeout: 120_000 }, () => {
     for (const doc of corpus) {
       const { rerender, unmount } = render(<Markdown source="" />);
       for (let cut = 0; cut <= doc.length; cut += 1) {

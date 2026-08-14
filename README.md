@@ -145,7 +145,23 @@ cd frontend && npm run typecheck              # TS strict
 
 No test touches the network, a live provider, or an audio device. See
 `docs/TESTING.md` for every test documented (what it verifies and why it
-exists), and `docs/learn/` for a guided curriculum over the whole codebase.
+exists).
+
+## Documentation
+
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the system map: the
+  pipeline and the thread each stage runs on, a file-by-file module map, the
+  Protocol seams, and the full command/event catalogue. Read this first.
+- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — symptom-driven
+  diagnosis, quoting the messages the app actually shows.
+- **[docs/TESTING.md](docs/TESTING.md)** — every test, and the failure mode
+  it guards.
+- **[docs/learn/](docs/learn/README.md)** — a thirteen-chapter curriculum
+  over this codebase: a guided tour, sixteen design decisions in ADR form,
+  flashcards, spot-the-bug, fire drills, exercises, and deep dives on the
+  bugs that shipped, testing craft, audio DSP, concurrency, the security
+  model, and the latency budget. Start at its README, which lays out reading
+  paths for different goals.
 
 ## Manual QA script
 
