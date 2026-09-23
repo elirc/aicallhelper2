@@ -230,6 +230,13 @@ provider a corrupted string as a bearer token. And when the OS keystore is
 unavailable I store a *labeled* plaintext fallback — degraded and honest
 beats broken or secretly insecure."
 
+**Superseded (2026-09-22).** The review (R02) showed the fallback was
+degraded but NOT honest where it mattered: the prefix was visible only in
+the file, while the UI kept saying "encrypted". Encoding now fails closed
+(`SecretEncryptionError` -> a visible save error, previous key kept);
+legacy `plain:` values still decode and are re-encrypted on the next save.
+The lesson: an honest label has to be where the user looks.
+
 ---
 
 ## ADR-10: Latency is measured, not vibed — and the metrics refuse to lie

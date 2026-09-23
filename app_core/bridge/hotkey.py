@@ -34,6 +34,8 @@ MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+# How long register() waits for the message-loop thread to report.
+REGISTER_TIMEOUT_S = 5.0
 
 _MODIFIERS = {
     "ctrl": MOD_CONTROL,
@@ -159,18 +161,30 @@ class HotkeyManager:
                 return self._settle("invalid")
             result: dict[str, bool] = {}
             ready = threading.Event()
+            # Decides, exactly once, whether a registration that finishes
+            # late is adopted by register() or abandoned by it.
+            handoff = threading.Lock()
+            thread_id: dict[str, int] = {}
 
             def run() -> None:
                 user32 = ctypes.windll.user32
                 kernel32 = ctypes.windll.kernel32
-                self._thread_id = kernel32.GetCurrentThreadId()
+                thread_id["id"] = kernel32.GetCurrentThreadId()
                 ok = bool(
                     user32.RegisterHotKey(
                         None, 1, parsed.modifiers | MOD_NOREPEAT, parsed.vk
                     )
                 )
-                result["ok"] = ok
+                with handoff:
+                    abandoned = result.get("abandoned", False)
+                    result["ok"] = ok and not abandoned
                 ready.set()
+                if ok and abandoned:
+                    # register() already gave up and reported failure: an
+                    # untracked thread holding the key could never be
+                    # unregistered and would block every later registration.
+                    user32.UnregisterHotKey(None, 1)
+                    return
                 if not ok:
                     return
                 try:
@@ -184,9 +198,13 @@ class HotkeyManager:
 
             thread = threading.Thread(target=run, name="hotkey", daemon=True)
             thread.start()
-            ready.wait(timeout=5.0)
+            ready.wait(timeout=REGISTER_TIMEOUT_S)
+            with handoff:
+                if "ok" not in result:
+                    result["abandoned"] = True  # run() will undo a late success
             if result.get("ok"):
-                self._thread = thread  # _thread_id was set inside run()
+                self._thread = thread
+                self._thread_id = thread_id.get("id")
                 return self._settle("registered")
             self._thread = None
             self._thread_id = None

@@ -16,6 +16,9 @@ export function formatLatencyChip(metrics: Metrics): string {
 export function formatLatencyTitle(metrics: Metrics): string {
   return (
     `First word ${metrics.firstTokenMs} ms after Stop · ` +
+    (typeof metrics.audioDrainMs === "number"
+      ? `audio drained ${metrics.audioDrainMs} ms · `
+      : "") +
     `transcript finalized ${metrics.sttFinalizeMs} ms · ` +
     `full answer ${(metrics.totalMs / 1000).toFixed(1)} s`
   );

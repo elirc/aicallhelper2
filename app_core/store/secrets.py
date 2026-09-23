@@ -1,20 +1,32 @@
-"""API-key encryption: Windows DPAPI with an honestly-labeled fallback.
+"""API-key encryption: Windows DPAPI, failing CLOSED.
 
-Stored values are `enc:<base64 of DPAPI blob>` or, when the OS keystore is
-unavailable, `plain:<base64>` — MARKED, still functional. Decoding goes by
-the STORED prefix, not by current keystore availability. Undecryptable
+New values are always stored as `enc:<base64 of DPAPI blob>`. When the OS
+keystore is unavailable or refuses, `encode_secret` raises
+`SecretEncryptionError` — the caller must fail the save visibly; a key is
+never silently written in a recoverable form while the UI says encrypted.
+
+`plain:<base64>` values written by older builds (which fell back silently)
+still DECODE, so an upgrade never loses a working key, and
+`secret_storage` reports them as "plaintext" so the UI can say so; the
+settings store re-encrypts them on the next successful save. Decoding goes
+by the STORED prefix, not by current keystore availability. Undecryptable
 values (e.g. a settings file copied from another machine) or unknown
-prefixes read as unset — fail closed, never hand the raw stored string to a
-provider.
+prefixes read as unset — never hand the raw stored string to a provider.
 """
 
 from __future__ import annotations
 
 import base64
-from typing import Protocol
+from typing import Literal, Protocol
 
 ENC_PREFIX = "enc:"
 PLAIN_PREFIX = "plain:"
+
+SecretStorage = Literal["encrypted", "plaintext"]
+
+
+class SecretEncryptionError(Exception):
+    """The OS keystore could not encrypt a secret; nothing was encoded."""
 
 
 class Keystore(Protocol):
@@ -40,14 +52,25 @@ class DpapiKeystore:
 
 
 def encode_secret(value: str, keystore: Keystore | None) -> str:
-    raw = value.encode("utf-8")
-    if keystore is not None:
-        try:
-            protected = keystore.protect(raw)
-            return ENC_PREFIX + base64.b64encode(protected).decode("ascii")
-        except Exception:
-            pass  # keystore unavailable -> marked plaintext fallback below
-    return PLAIN_PREFIX + base64.b64encode(raw).decode("ascii")
+    """`enc:` + DPAPI blob. Raises SecretEncryptionError rather than ever
+    falling back to a recoverable encoding."""
+    if keystore is None:
+        raise SecretEncryptionError("no keystore available")
+    try:
+        protected = keystore.protect(value.encode("utf-8"))
+    except Exception as exc:
+        raise SecretEncryptionError(str(exc) or type(exc).__name__) from exc
+    return ENC_PREFIX + base64.b64encode(protected).decode("ascii")
+
+
+def secret_storage(stored: object) -> SecretStorage | None:
+    """How a stored value is protected on disk, by its prefix alone."""
+    if isinstance(stored, str):
+        if stored.startswith(ENC_PREFIX):
+            return "encrypted"
+        if stored.startswith(PLAIN_PREFIX):
+            return "plaintext"
+    return None
 
 
 def decode_secret(stored: object, keystore: Keystore | None) -> str | None:

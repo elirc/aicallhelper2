@@ -373,5 +373,5 @@ This is why the codebase is shaped the way it is: a wiring suite for the
 seam nothing owned, resampler tests that are measurements, fences that
 manufacture their races, and a `TESTING.md` that records — for every
 test — the failure it exists to prevent. The suites were green through
-all six of these. The current 297 + 148 are not proof there is no
+all six of these. The current suites are not proof there is no
 seventh; they are the accumulated cost of the first six.

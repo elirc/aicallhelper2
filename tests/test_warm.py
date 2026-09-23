@@ -69,6 +69,20 @@ class TestPreWarm:
         await task  # swallows the ConnectError
 
 
+class TestTaskOwnership:
+    async def test_an_in_flight_warm_is_strongly_held_until_it_finishes(self) -> None:
+        # The loop holds tasks only weakly and production callers discard
+        # the returned task; the warmer must keep it alive itself, then let go.
+        log: list[str] = []
+        warmer, _clock = make(log)
+        task = warmer.warm("https://a.example")
+        assert task is not None
+        assert task in warmer._in_flight
+        await task
+        await asyncio.sleep(0)  # done callbacks run on the next loop turn
+        assert warmer._in_flight == set()
+
+
 class TestOffLoop:
     def test_warm_outside_a_running_loop_returns_none_instead_of_raising(self) -> None:
         # The contract is "a failed warm costs nothing and must never raise";

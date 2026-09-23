@@ -18,18 +18,28 @@ funnel through the same function, so the clock always starts at the moment
 the user (or the cap) decided the question was over. For a typed Ask, the
 clock starts when the command is accepted (`machine.py`, `ask()`).
 
-Every `llm:done` carries three metrics:
+Every `llm:done` carries four metrics, all measured in the core from
+Stop ACCEPTANCE (before the audio drain — the user waits for the drain, so
+it counts; moving the origin later would flatter the number without making
+anyone wait less):
 
-- **`sttFinalizeMs`** — stop request → final transcript in hand.
-- **`firstTokenMs`** — stop request → first answer delta. This is THE
+- **`audioDrainMs`** — Stop → every pre-Stop sample delivered and the
+  device closed (bounded at 2 s).
+- **`sttFinalizeMs`** — drain complete → final transcript in hand.
+- **`firstTokenMs`** — Stop → first answer delta. This is THE
   number; the answer panel's chip renders it as "0.9s to first word"
   (`frontend/src/format.ts`), one decimal, and hovering the chip shows all
   three.
-- **`totalMs`** — stop request → last delta received.
+- **`totalMs`** — Stop → last delta received.
+
+All four are core-side: bridge transit, event batching and paint happen
+after `firstTokenMs` is stamped, so the first word appears on screen a
+little later than the chip says. A true visible-latency benchmark needs a
+frontend timestamp as well (see `fabledocs/PROJECT-REVIEW-2026-09-19.md` §5).
 
 Two honesty rules, both purchased with the temptation to lie:
 
-- **A typed Ask reports `sttFinalizeMs` of exactly 0.** There was no STT
+- **A typed Ask reports `audioDrainMs` and `sttFinalizeMs` of exactly 0.** There was no STT
   stage; billing one would be a lie (`machine.py`, `_run_ask`, guarded by
   `test_ask_event_shape_and_metrics`).
 - **A provider that never streamed reports `firstTokenMs == totalMs` —
@@ -250,15 +260,16 @@ nothing in either direction.
 |---|---|---|
 | Transcript lags while they speak | Deepgram network path | Level meter moving? Silence hint showing? |
 | "Finalizing transcript…" for seconds | Deepgram tail flush (5 s cap) | `sttFinalizeMs` in the chip hover |
-| Slow first word, small `sttFinalizeMs` | Cold TLS or provider TTFT | `firstTokenMs − sttFinalizeMs`; provider status page |
+| Slow first word, small drain + finalize | Cold TLS or provider TTFT | `firstTokenMs − audioDrainMs − sttFinalizeMs`; provider status page |
 | First word fast, answer drags | Completion length / throughput | `totalMs` vs `firstTokenMs`; try the Brief style |
 | UI stutters while streaming | Renderer / dispatch backlog | Run the markdown-hardening tests |
 | Record press itself is sluggish | DPAPI key read on start | Not the latency budget — key reads fail the command, never the clock |
 | Error at exactly 10 s or 60 s | The LLM watchdogs fired | Provider is up but slow; retry |
 | Recording stops by itself at 2:00 | The 120 s cap — by design | The answer still arrives; status says so |
 
-The stages are separable because the metrics are: `sttFinalizeMs` isolates
-Deepgram, `firstTokenMs − sttFinalizeMs` isolates warm-up plus provider
+The stages are separable because the metrics are: `audioDrainMs` isolates
+the device stop, `sttFinalizeMs` isolates Deepgram,
+`firstTokenMs − audioDrainMs − sttFinalizeMs` isolates warm-up plus provider
 TTFT, and `totalMs − firstTokenMs` isolates completion throughput. When a
 user says "it's slow", the chip hover usually answers which of the three
 it was before you open a single file.

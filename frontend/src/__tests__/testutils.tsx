@@ -6,16 +6,47 @@
 import { act, screen, waitFor } from "@testing-library/react";
 import { expect, vi, type Mock } from "vitest";
 
-import type { Result, SettingsView } from "../types";
+import type { Profile, Result, SettingsView } from "../types";
+
+export const CALL_TYPE_CHOICES = [
+  { id: "behavioral", label: "Behavioral interview" },
+  { id: "technical", label: "Technical screen" },
+  { id: "system_design", label: "System design" },
+  { id: "recruiter", label: "Recruiter screen" },
+  { id: "sales", label: "Sales or customer call" },
+  { id: "meeting", label: "General meeting" },
+] as const;
+
+export function profile(overrides: Partial<Profile> = {}): Profile {
+  return {
+    id: "default",
+    name: "Default",
+    callType: "behavioral",
+    focus: "",
+    resume: "",
+    jobDescription: "",
+    notes: "",
+    ...overrides,
+  };
+}
 
 export function settingsView(overrides: Partial<SettingsView> = {}): SettingsView {
   return {
     resume: "",
     jobDescription: "",
+    callType: "behavioral",
+    focus: "",
+    notes: "",
+    activeProfileId: "default",
+    profiles: [profile()],
+    callTypes: [...CALL_TYPE_CHOICES],
     alwaysOnTop: true,
     llmProvider: "anthropic",
     answerStyle: "balanced",
     hotkey: "Ctrl+Shift+Space",
+    layoutMode: "full",
+    prompterFontPx: 18,
+    answerFontPx: 14,
     providers: [
       { id: "anthropic", displayName: "Claude Haiku 4.5 (recommended)" },
       { id: "groq", displayName: "Groq GPT-OSS 120B (fastest)" },
@@ -37,6 +68,31 @@ export interface MockApi {
   ask: Mock;
   cancel_session: Mock;
   heartbeat: Mock;
+  dock_window: Mock;
+  open_external: Mock;
+  /** Optional like the real core's: absent unless a test installs it. */
+  get_status?: Mock;
+  set_close_guard?: Mock;
+}
+
+/** A get_status snapshot (R01 contract); override any field. */
+export function statusSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    revision: 1,
+    coreReady: true,
+    protection: "protected",
+    session: { id: null, phase: "idle" },
+    ...overrides,
+  };
+}
+
+/** A promise plus its resolver, for interleaving bridge responses. */
+export function deferred<T = unknown>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 export function ok<T>(value: T): Result<T> {
@@ -56,6 +112,8 @@ export function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
     ask: vi.fn(async () => ok("s1")),
     cancel_session: vi.fn(async () => ok(null)),
     heartbeat: vi.fn(async () => ok(null)),
+    dock_window: vi.fn(async () => ok(null)),
+    open_external: vi.fn(async () => ok(null)),
     ...overrides,
   };
   (window as unknown as { pywebview: { api: MockApi } }).pywebview = { api };

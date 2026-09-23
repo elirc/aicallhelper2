@@ -72,7 +72,13 @@ describe("settings view", () => {
     await settle();
     expect(api.set_settings).toHaveBeenCalledTimes(1);
     const patch = api.set_settings.mock.calls[0]?.[0];
-    expect(patch.resume).toBe("my resume");
+    // Profile text travels inside the profiles list; the edited profile is
+    // the one that becomes active.
+    expect(patch.profiles).toHaveLength(1);
+    expect(patch.profiles[0].resume).toBe("my resume");
+    expect(patch.profiles[0].id).toBe("default");
+    expect(patch.activeProfileId).toBe("default");
+    expect(patch.resume).toBeUndefined();
     expect(patch.keys).toEqual({ groq: "gsk-123" }); // deepgram/anthropic untouched
     await screen.findByText("Saved ✓");
   });

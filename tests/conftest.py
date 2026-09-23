@@ -8,7 +8,9 @@ seams production uses (SttStream, AnswerProvider, AudioSource, EventSink).
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Executor, Future
 from typing import Any
 
 import httpx
@@ -34,6 +36,9 @@ class FakeSettings:
         self.job_description = ""
         self.style = "balanced"
         self.provider_id = "fake"
+        self.call_type = "behavioral"
+        self.focus = ""
+        self.notes = ""
         self.secrets: dict[str, str] = {"deepgram": "dg-key", "fake": "llm-key"}
 
     def answer_config(self) -> AnswerConfig:
@@ -42,6 +47,9 @@ class FakeSettings:
             job_description=self.job_description,
             style=self.style,
             provider_id=self.provider_id,
+            call_type=self.call_type,
+            focus=self.focus,
+            notes=self.notes,
         )
 
     def get_secret(self, secret_id: str) -> str | None:
@@ -62,11 +70,32 @@ class CollectSink:
         return [(n, p) for n, p in self.events if p.get("sessionId") == session_id]
 
 
+class InlineExecutor(Executor):
+    """Runs audio-worker calls synchronously at submit time, so the suite's
+    FakeAudio stays deterministic. Tests that need a real worker thread (loop
+    responsiveness, drain latency) pass a ThreadPoolExecutor instead."""
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
 class FakeAudio:
     def __init__(self) -> None:
         self.on_frame: Callable[[bytes, float], None] | None = None
         self.starts = 0
         self.stops = 0
+        self.drains = 0
+        # stop_and_drain knobs: a pre-Stop remainder to deliver, a blocking
+        # device-teardown delay, and the loop to post to (set when the drain
+        # runs on a real worker thread, like LoopbackCapture's posting).
+        self.tail: bytes | None = None
+        self.drain_delay_s = 0.0
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     def start(self, on_frame: Callable[[bytes, float], None]) -> None:
         self.starts += 1
@@ -75,6 +104,18 @@ class FakeAudio:
     def stop(self) -> None:
         self.stops += 1
         self.on_frame = None
+
+    def stop_and_drain(self) -> None:
+        self.drains += 1
+        self.stops += 1
+        on_frame, self.on_frame = self.on_frame, None
+        if self.drain_delay_s:
+            time.sleep(self.drain_delay_s)
+        if on_frame is not None and self.tail is not None:
+            if self.loop is not None:
+                self.loop.call_soon_threadsafe(on_frame, self.tail, 0.1)
+            else:
+                on_frame(self.tail, 0.1)
 
     def feed(self, pcm: bytes, rms: float = 0.5) -> None:
         if self.on_frame is not None:
@@ -160,9 +201,11 @@ class FakeProvider:
         self.fail_after_first_delta: BaseException | None = None
         self.requests_built = 0
         self.stream_calls = 0
+        self.prompts: list[PromptParts] = []
 
     def build_request(self, prompt: PromptParts, api_key: str) -> ProviderRequest:
         self.requests_built += 1
+        self.prompts.append(prompt)
         body = (prompt.cached_prefix + prompt.style_suffix + prompt.user_message).encode()
         return ProviderRequest(
             url="https://fake.example/v1/answer",
@@ -204,7 +247,7 @@ class FakeProvider:
 
 
 class Harness:
-    def __init__(self, timeouts: Timeouts) -> None:
+    def __init__(self, timeouts: Timeouts, audio_executor: Executor | None = None) -> None:
         self.settings = FakeSettings()
         self.sink = CollectSink()
         self.audio = FakeAudio()
@@ -223,6 +266,7 @@ class Harness:
             warmer=self.warmer,
             events=self.sink,
             timeouts=timeouts,
+            audio_executor=audio_executor or InlineExecutor(),
         )
 
     async def settle(self, rounds: int = 40) -> None:

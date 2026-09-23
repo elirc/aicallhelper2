@@ -59,8 +59,10 @@ has already failed to catch here once.
   `TestProviderConformance` list?** The conformance suite running against
   every provider is what keeps the shared pipeline vendor-neutral.
 - **Is every new error message actionable copy inside the closed
-  `ErrorCode` set?** The Groq 404 message names the exact constant to
-  update because Groq retires models on short notice; "internal error"
+  `ErrorCode` set, and actionable by the person who will SEE it?** The
+  Groq 404 message once told users to edit a source constant — useless in
+  a packaged app; it now names the retired model and says to switch
+  provider or update the app; "internal error"
   sent users hunting through logs for a missing audio device.
 - **Prompt changes: do the byte-equality tests still pass, and does a
   style flip still leave the cached prefix untouched?** The style policy

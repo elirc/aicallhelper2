@@ -15,8 +15,10 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 WARM_TIMEOUT_S = 3.0
 WARM_THROTTLE_S = 2.0
@@ -34,6 +36,11 @@ class PreWarmer:
         self._clock = clock
         self._throttle_s = throttle_s
         self._last_warm: dict[str, float] = {}
+        # The loop keeps only WEAK references to tasks; production callers
+        # drop the returned task, so without this set an in-flight warm can
+        # be garbage-collected mid-request ("Task was destroyed but it is
+        # pending"). Each task removes itself when it finishes.
+        self._in_flight: set[asyncio.Task[None]] = set()
 
     def warm(self, origin: str) -> asyncio.Task[None] | None:
         """Fire-and-forget warm, throttled to one per origin per 2 s.
@@ -49,7 +56,10 @@ class PreWarmer:
         if last is not None and now - last < self._throttle_s:
             return None
         self._last_warm[origin] = now
-        return loop.create_task(self._do_warm(origin))
+        task = loop.create_task(self._do_warm(origin))
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        return task
 
     async def _do_warm(self, origin: str) -> None:
         # httpx .get reads the body to completion before returning, which is

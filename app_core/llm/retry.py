@@ -15,11 +15,20 @@ build_request is reused as-is.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-import httpx
+from app_core.llm.base import (
+    AnswerProvider,
+    AnswerResult,
+    ProviderFailure,
+    ProviderRequest,
+    StreamEnd,
+)
 
-from app_core.llm.base import AnswerProvider, ProviderRequest
+if TYPE_CHECKING:
+    import httpx
 
 
 async def stream_answer(
@@ -27,23 +36,44 @@ async def stream_answer(
     request: ProviderRequest,
     http: httpx.AsyncClient,
     on_delta: Callable[[str], None],
-) -> str:
-    """Stream the answer, applying the retry-once policy. Returns the full answer text.
+) -> AnswerResult:
+    """Stream the answer, applying the retry-once policy.
 
     The full answer is the concatenation of every delta with nothing between
-    — it must equal what streamed into the panel byte for byte.
+    — it must equal what streamed into the panel byte for byte. How it ended
+    comes from the provider's StreamEnd (absent = "complete"). A finished
+    stream with no non-whitespace text is a failure ("empty_answer"), never
+    a blank success: the server heard us, so it is not retried either.
     """
     attempt = 0
     while True:
         attempt += 1
         got_delta = False
         parts: list[str] = []
+        end = StreamEnd()
         try:
-            async for delta in provider.stream(request, http):
-                got_delta = True
-                parts.append(delta)
-                on_delta(delta)
-            return "".join(parts)
+            items = provider.stream(request, http)
+            try:
+                async for item in items:
+                    if isinstance(item, StreamEnd):
+                        end = item
+                        continue
+                    got_delta = True
+                    parts.append(item)
+                    on_delta(item)
+            finally:
+                # If on_delta raises, close the provider's generator (and the
+                # HTTP response it holds open) now, not whenever GC gets to it.
+                aclose = getattr(items, "aclose", None)
+                if aclose is not None:
+                    with contextlib.suppress(Exception):
+                        await aclose()
+            text = "".join(parts)
+            if not text.strip():
+                raise ProviderFailure(
+                    "empty_answer", finish=end.finish, detail=end.stop_reason or ""
+                )
+            return AnswerResult(text=text, finish=end.finish, stop_reason=end.stop_reason)
         except asyncio.CancelledError:
             raise  # abort is control flow — never retried, never remapped
         except Exception as exc:

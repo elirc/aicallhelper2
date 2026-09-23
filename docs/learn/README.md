@@ -9,6 +9,36 @@ concrete failure — and the failures are real, proved by measurement, a
 mutation-testing pass, and four adversarial audit rounds recorded in the
 git log.
 
+> **Which version this describes.** The curriculum was written against the
+> 2026-09-18 code (v3.1.0, commit `c6191b5` plus that pass). The
+> 2026-09-22 production-readiness pass changed several mechanisms it
+> teaches; where a chapter and `docs/ARCHITECTURE.md` disagree, ARCHITECTURE
+> is current. Most chapters quote the older code deliberately (the bugs and
+> their fixes are the lesson), so they were not rewritten; the factual
+> Q&A (flashcards, performance, security) was updated. What changed:
+>
+> - **Stop drains audio.** "Rule 4" is now a *capture cutoff*: frames are
+>   accepted until the Stop drain has delivered every pre-Stop sample (on a
+>   dedicated audio worker thread, bounded at 2 s), then rejected. The
+>   latency clock still starts at Stop acceptance, before the drain; a new
+>   `audioDrainMs` metric splits the drain out of `sttFinalizeMs`.
+> - **The 120 s cap starts when capture is running**, and the new
+>   `session:recording {deadlineMs, capMs}` event drives the UI countdown.
+> - **Provider completion is validated.** Eight `FailureKind`s (added
+>   `provider_error`, `incomplete`, `empty_answer`); `llm:done` carries
+>   `finish`; an empty answer is a `session:error`, never a blank success.
+>   The Groq 404 message no longer asks users to edit source.
+> - **Keys fail closed.** DPAPI failure fails the save; there is no new
+>   `plain:` fallback (legacy values still decode).
+> - **Event dispatch** runs on bounded dispatch threads (not
+>   `asyncio.to_thread`) with `seq`/`pageGen` stamps, a bounded queue and
+>   re-sent reserved events; the page resynchronizes from `get_status()`.
+> - **Protection status** is tri-state and shown in every view.
+> - **Refused-stop recovery** is disarmed by progress and scoped to its
+>   session (the fixed 20 s recovery described in 02/07/10 is history).
+> - **Settings** preserve an unreadable file as a `.bak` before any write
+>   and support a save-revision precondition.
+
 The curriculum is thirteen documents in two layers: a **core sequence**
 (01–06, six different learning methods — do these in order the first time
 through) and **deep dives** (07–13, one topic each — read on demand, in

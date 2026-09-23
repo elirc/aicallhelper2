@@ -10,8 +10,8 @@ frontend through the real components with a mocked command/event bridge.
 Run them:
 
 ```
-.venv\Scripts\python -m pytest tests -q        # core (297 tests)
-cd frontend && npm test                        # frontend (148 tests)
+.venv\Scripts\python -m pytest tests -q        # core (519 tests)
+cd frontend && npm test                        # frontend (236 tests)
 ```
 
 ---
@@ -144,10 +144,11 @@ cd frontend && npm test                        # frontend (148 tests)
 ### tests/test_secrets.py — DPAPI secret semantics
 
 - **test_roundtrip_encrypted** — enc: roundtrip through the keystore.
-- **test_keystore_unavailable_falls_back_to_marked_plain /
-  test_failing_keystore_falls_back_to_marked_plain** — no keystore (or a
-  throwing one) → `plain:` MARKED fallback, honestly labeled, still
-  functional.
+- **test_keystore_unavailable_fails_closed /
+  test_failing_keystore_fails_closed** — no keystore (or a throwing one) →
+  `SecretEncryptionError`; no new key is ever stored recoverably. Replaced the
+  old `plain:` fallback tests on 2026-09-22 (R02; see the production-readiness
+  pass below).
 - **test_key_material_never_stored_raw** — the raw key never appears in the
   stored string.
 - **test_unicode_keys_survive** — UTF-8 roundtrip.
@@ -251,7 +252,8 @@ provider"):
 - **test_connection_failure_is_connect_kind** — the only retryable kind.
 - **test_mid_stream_drop_is_stream_drop_kind** — deltas before the drop
   still made it out (the UI keeps the partial); the drop is not "connect"
-  (which would wrongly retry after paint).
+  (which would wrongly retry after paint). The body carries no terminal
+  event, since Anthropic stops reading at `message_stop`.
 - **test_abort_classified_first_never_a_scary_http_error** — CancelledError
   → `aborted` BEFORE any HTTP inspection.
 - **test_401_maps_to_llm_auth / test_429_maps_to_rate_limit** — the closed
@@ -286,9 +288,11 @@ TestGroqSpecifics:
   sentinel to skip, not a terminator; treating it as EOF drops any bytes
   that follow in the same chunk.
 - **test_truncated_stream_flushes_last_words** — the SSE flush rule
-  end-to-end through a provider.
-- **test_404_points_at_the_pinned_model_constant** — Groq retires models on
-  short notice; the message tells the user exactly which constant to update.
+  end-to-end through a provider: the last words still reach the panel, but a
+  stream with neither `finish_reason` nor `[DONE]` raises `incomplete`.
+- **test_404_gives_an_actionable_message_never_an_edit_the_source_one** —
+  Groq retires models on short notice; the message names the model and says
+  to switch to Claude in Settings or update the app, never to edit source.
 - **test_403_reports_actual_status** — a 403 labelled 401 sends the user
   debugging the wrong thing.
 - **test_5xx_unavailable / test_stream_drop_message** — remaining matrix
@@ -359,9 +363,10 @@ TestStopContract (rule 3):
 
 TestAudioRouting (rule 4):
 
-- **test_frames_after_stop_requested_are_dropped** — an in-flight frame
-  arriving after stop is dropped; sending it would race the CloseStream
-  flush.
+- **test_frames_after_the_capture_cutoff_are_dropped** — a frame queued
+  before Stop is accepted (it is drained); once the drain closes the capture
+  cutoff, frames are dropped, since sending them would race the CloseStream
+  flush. Rule 4 was redefined on 2026-09-22 (R06).
 - **test_frames_for_stale_session_dropped** — a stale callback delivers to
   no one.
 
@@ -465,6 +470,10 @@ way pywebview drives it):
 - **test_set_settings_notifies_and_a_failing_hook_never_fails_the_save** —
   window/hotkey application errors must not turn a successful save into a
   reported failure.
+- **test_the_settings_hook_runs_off_the_core_loop** — applying settings
+  re-registers the global hotkey, which joins the old message-loop thread
+  and waits on the new one; that blocking work runs in a worker, never on
+  the loop that pumps audio frames and events.
 - **test_heartbeat_updates_liveness** — the crash-recovery watchdog's
   signal actually moves.
 - **test_open_external_https_only** — https opens in the default browser;
@@ -513,6 +522,12 @@ WebviewEventSink (fake window capturing evaluate_js):
   connect coroutine raises the structured error.
 - **test_abort_suppresses_the_death_it_causes** — abort causes a close; that
   close is never reported (rule 1's "abort must not be reported as error").
+- **TestAbortDuringHandshake::test_abort_before_the_socket_opens_closes_it_on_arrival**
+  — abort() landing while the WebSocket handshake is in flight. The socket
+  that opens a moment later belongs to nobody: it is closed at once (code
+  1000) instead of spawning reader/sender/keepalive tasks that pinned it
+  open until Deepgram's idle timeout, no error is reported, and a later
+  finalize() returns immediately. Verified to fail without the fix.
 - **test_finalize_is_idempotent_second_call_joins** — two concurrent
   finalize calls send ONE CloseStream and return the same transcript.
 - **test_never_opened_stream_finalizes_immediately** — no socket → return
@@ -646,7 +661,8 @@ WebviewEventSink (fake window capturing evaluate_js):
 
 ### src/__tests__/app-history.test.tsx — history + regenerate
 
-- **hidden until 2+ entries** — the bar earns its space.
+- **offers Clear from one entry; navigation only from two** — a single
+  answer must be clearable; prev/next and n/m appear only at 2+.
 - **prev/next navigation shows the viewed entry** — n/m label and content
   switch together.
 - **only the last 6 entries kept** — oldest trimmed; entry 1 gone, entry 2
@@ -739,6 +755,16 @@ each of these tests exists because a specific one of them shipped.
 - **TestAudioFailure::test_audio_start_failure_surfaces_actionably_and_frees_the_slot**
   — a loopback device that fails to open said "internal error"; now it names
   the device, leaks no exception text, and releases the slot.
+- **TestAnswerTimeMisconfiguration** — settings can change between Record
+  and Stop, so the key checks at start are a courtesy, not a guarantee.
+  A provider removed mid-session fails with the "pick one in Settings"
+  message; an LLM key removed mid-session fails with `no_llm_key`; a
+  finalize() that truly hangs (past the stream's own 5 s cap) fails with
+  `stt_timeout` and tears the stream down. In every case: no LLM call, and
+  the slot is released.
+- **TestConnectCrashes** — a non-`AppError` exception out of connect()
+  surfaces as `stt_connect` with no raw exception text and frees the slot;
+  the same crash from a start that already lost the race is silent.
 - **test_deepgram_client.py::test_closestream_never_overtakes_queued_audio**
   — CloseStream used to be written directly on the socket while audio went
   through a queue. Under send backpressure it overtook queued frames, and
@@ -771,6 +797,14 @@ each of these tests exists because a specific one of them shipped.
   **test_no_stray_tmp_files_are_left_behind** pins the visible half — no tmp
   file survives a write — but nothing asserts the two writers get distinct
   names, so that half rests on the lock test above.
+- **TestTransientRenameFailures (2 tests)** — antivirus real-time scanning
+  and the search indexer hold a freshly written file open for a few
+  milliseconds on Windows, so the atomic `os.replace` can fail with
+  `PermissionError` when nothing is wrong; that surfaced as "Something went
+  wrong inside the app core" on Save. The rename now retries briefly (five
+  attempts, backing off from 20 ms). A transient failure saves cleanly with
+  no tmp file left behind; a persistent one still raises, and memory keeps
+  matching disk.
 - **TestKeyCharsetValidation (2 tests)** — a key with a smart quote reached
   httpx and raised UnicodeEncodeError mid-answer, surfacing as "internal
   error"; it is now refused at save time with a message naming the cause.
@@ -925,6 +959,21 @@ answer, no level meter, no errors.
 - **test_an_emitted_event_actually_reaches_the_window** — end to end across
   the seam: `sink.emit` → pump → `window.evaluate_js`, asserting the payload
   and the `app:event` name actually arrive.
+- **TestRendererWatchdog** — the heartbeat is a hint, not a verdict. Chromium
+  throttles timers in a hidden page to once per minute after five minutes
+  minimized, so a stale heartbeat with a healthy page is the *normal* state
+  of a minimized app; reloading on it wiped the history every ~25 s the
+  window sat in the taskbar. The watchdog now probes the page with a direct
+  `evaluate_js` first: a fresh heartbeat never probes; a stale one from a
+  live page is forgiven (and the clock restarts, so no probe storm); a
+  renderer that raises or hangs on the probe is reloaded, at most once per
+  cooldown; no window yet is a no-op.
+- **TestGeometryPersistence** — closing flushes the pending debounced save
+  and cancels its timer; minimized geometry never overwrites real geometry;
+  a save with no window is harmless.
+- **TestShellHelpers** — `AICA_DEV_URL` wins over the built frontend; loop
+  exceptions land in `crash.log`; the log rotates to `crash.log.1` once it
+  grows past the cap.
 
 ### tests/test_bridge.py — batch failure isolation
 
@@ -1036,3 +1085,588 @@ the fix was verified by re-applying the mutation.
   at (-32000, -32000) with a titlebar-sized rect; the debounced save wrote it,
   so quitting while minimized lost the window position the user had arranged.
   `plausible_bounds` now rejects it (`TestMinimizedGeometry`).
+
+
+## Eye-level, profiles and startup pass (2026-09-18)
+
+### tests/test_prompt.py::TestCallTypes — call-type tailoring
+
+- **test_default_call_type_is_behavioral_and_is_the_original_prompt** —
+  omitting `call_type` equals `behavioral`, and `ROLE_INSTRUCTIONS` is that
+  role. Why: the original single-purpose prompt must stay the default.
+- **test_unknown_call_type_falls_back_to_behavioral** — corrupt values fall
+  back like unknown styles do.
+- **test_every_call_type_has_a_distinct_role_and_grounding** — six distinct
+  roles/groundings, none containing the literal `RESUME` (a sibling test
+  asserts a JD-only prefix lacks it).
+- **test_choices_follow_definition_order_with_labels** — the UI list comes
+  from the module, in order.
+- **test_sections_land_in_a_fixed_order** — role, resume, JD, focus, notes,
+  grounding. Why: caching is a byte-prefix match; order must be stable.
+- **test_grounding_appended_when_only_focus_or_only_notes_present** — any
+  profile text triggers the grounding rule.
+- **test_focus_and_notes_are_edge_trimmed_only** — interior formatting
+  survives.
+- **test_sales_and_meeting_use_the_call_context_header** — no
+  "INTERVIEWING" on a sales call.
+- **test_call_type_and_focus_live_in_the_prefix_never_the_suffix** — the
+  style suffix is identical across all call types and focus values. Why:
+  it sits after the cache breakpoint.
+- **test_detailed_suffix_defers_structure_to_the_call_guidance** — STAR is
+  behavioral's, not everyone's.
+
+### tests/test_settings.py — profiles, layout, fonts
+
+- **TestProfilesMigration** (4) — a legacy file becomes one lossless
+  `Default` profile; load never writes; the migrated shape lands on the
+  next save with mirrors; profiles win over stale mirrors.
+- **TestProfilesLoadFallback** (6) — non-list profiles, corrupt entries,
+  per-field fallback inside an entry, unknown active id, duplicate ids
+  (first wins), the 20 cap, and layout/font fields falling back alone.
+- **TestProfilesPatch** (11) — top-level resume patches only the active
+  profile; callType/focus/notes validation; full-list replace assigns ids
+  and rejects bad lists all-or-nothing; active id must exist; a new profile
+  can be activated in the same patch; call types listed in order;
+  `answer_config` carries the active profile; mirrors track a switch;
+  layout mode and font sizes validate; per-mode window bounds are
+  independent and survive a reload.
+
+### tests/test_bounds.py::TestDocking
+
+- **top_center** centres against the top margin, shrinks an oversize window
+  (460x700 on a 672-tall work area → 656), handles negative origins;
+  **primary_area** picks the origin display regardless of order.
+
+### tests/test_bridge.py::TestDockAndCoreReadiness
+
+- **dock_window** calls the shell hook, is a no-op without one, and
+  swallows a raising hook. **Session commands wait for a late core then
+  run**; **fail actionably if it never arrives** while settings still work.
+
+### tests/test_app_wiring.py
+
+- **TestInitialPlacement** (6) — first run docks top-centre and fits;
+  stored on-screen bounds restore verbatim; off-screen keeps size but
+  docks; no displays → OS placement; primary chosen over a left monitor;
+  full-layout restore clamps to `FULL_MIN_HEIGHT`.
+- **TestDockingAndLayoutSwitch** (7) — `_dock_current` keeps size and
+  moves to the camera line; switching to prompter saves the full geometry
+  and docks the strip (a repeated view does not move it again); switching
+  back restores; a saved prompter position is restored, an off-screen one
+  docks; bounds saves land under the current mode's key; runtime work
+  areas divide by the scale.
+- **TestDeferredCore** (3) — the window can exist before the core; `_build_core`
+  hands the machine to the bridge; `shown`/`loaded` restart the watchdog clock.
+
+### tests/test_machine.py::TestStopContract
+
+- **test_stop_during_connect_is_taken_and_finalizes_once_the_socket_opens** —
+  replaces the old "not taken" assertion: capture stops at once, finalize
+  waits for the socket, early frames are kept, late frames dropped, one
+  `llm:done`. **test_connect_failure_after_a_deferred_stop_still_surfaces**.
+
+### tests/test_deepgram_client.py — flake fixes
+
+- `wait_until` replaces fixed sleeps in the keepalive/handshake tests. Why:
+  the Windows proactor quantises timers to ~16 ms and overshoots under
+  load; a 0.16 s budget failed 7/7 in isolation on a slow machine.
+
+### Frontend — src/__tests__/app-prompter.test.tsx (13)
+
+- Strip renders instead of the panel; streams at the persisted size with
+  the one-line question titled; top-anchored (scrollTop stays 0); A−/A+
+  persist `prompterFontPx` and clamp; Dock calls `dock_window`; Exit/Esc
+  and the header button switch layouts; the hotkey toggles recording in
+  the strip; errors and the protection verdict alert and dismiss. Full
+  layout: provider chip, dock button, answer-before-question DOM order,
+  `answerFontPx` buttons, dismissible errors.
+
+### Frontend — src/__tests__/app-profiles.test.tsx (12)
+
+- Profile select hidden with one profile; switching persists
+  `activeProfileId` and renders the PERSISTED value; call type persists;
+  options come from the view in order. Settings: Add assigns a client id
+  and Save activates it; Delete disabled at one; Duplicate copies with
+  "(copy)"; labels switch for sales; canonical ids adopted after Save; a
+  key typed and emptied does NOT erase (BUG-03); Remove sends an explicit
+  empty key; the unsaved-changes guard; "Get a key" opens externally.
+
+### Frontend — src/__tests__/app-settings.test.tsx (changed)
+
+- The save-shape test now asserts `patch.profiles[0].resume` and
+  `patch.activeProfileId` instead of top-level `resume`.
+
+## Production-readiness pass (2026-09-22)
+
+### Frontend: status snapshot, command generations, drafts, contract
+
+
+Frontend total after this pass: 235 tests in 18 files (was 173 in 13).
+
+#### Changed existing entries
+
+##### src/__tests__/app-history.test.tsx
+- replace **hidden until 2+ entries** with **offers Clear from one entry; navigation only from
+  two** — a single answer must be clearable (review §5); prev/next and n/m appear only at 2+.
+- **an aborted attempt that captured nothing is discarded** — now asserts no navigation (the
+  bar itself is visible from one entry).
+
+##### src/__tests__/app-gestures.test.tsx
+- **during 'starting' aborts silently…** — the status copy is now "Starting system-audio
+  capture…" and the test asserts no "microphone" wording anywhere (loopback captures system
+  output; §4).
+- **during 'finalizing' is ignored** — the button now reads "Finalizing…" with
+  `aria-disabled="true"` (not `disabled`, so keyboard focus survives Stop); a click still does
+  nothing.
+
+#### New files
+
+##### src/__tests__/app-status.test.tsx — protection verdict + status snapshot (R01, R07, R11) — 16 tests
+- **stays an alert after opening Settings, and Settings claims nothing false** — the R01
+  reproduction: `protection:failed`, open Settings, the alert is still there and the old static
+  "hidden from screen sharing" sentence is gone.
+- **shows 'not confirmed' before any verdict, in the full view and Settings** — tri-state: no
+  verdict never reads as protected.
+- **shows the confirmed verdict once Windows reports it**.
+- **shows 'not confirmed' in the prompter strip too**.
+- **Settings opened from the prompter keeps the failure alert**.
+- **adopts a failed verdict on load with no push event at all** — `get_status()` on mount, so a
+  verdict emitted before React subscribed (or before a reload) is not lost.
+- **an older snapshot cannot overwrite a fresher pushed verdict** — revision ordering closes the
+  snapshot-vs-event race (§8 R01).
+- **a stale protection event is ignored once a newer revision is known**.
+- **a failed or missing status command leaves the verdict unknown** — older core / error path.
+- **re-adopts a session still recording behind a reloaded page, so Stop works** — no second
+  session is started (§8 R11).
+- **does not resume an idle or unknown-phase session**.
+- **drops events stamped for a superseded page generation** — `pageGen` < own generation
+  (a timed-out `evaluate_js` landing after reload, R07).
+- **parseStatus: accepts the Result envelope and a bare object / rejects malformed snapshots /
+  normalizes a missing session to idle** (3 tests) — a malformed snapshot must never flip the
+  verdict.
+- **settings load failure: says so and retries until the core answers** — the first-load failure
+  used to leave settings null forever with no message (R11).
+
+##### src/__tests__/app-races.test.tsx — command generations, ordering, recovery (R04, R07, R08, §4, §5, R03 contract) — 19 tests
+- **a stale start-aborted does not null the newer session's id** — start A, abort, start B → s2,
+  then A resolves `aborted`: B keeps Stop, its events and a working stop (§8: stale-abort branch).
+- **a stale start-failed does not flip the newer session to idle or show its error** — distinct
+  expectation for the stale-failure branch (§8).
+- **an explicit abort is honoured even after a newer start began** — A resolving ok after B began
+  is cancelled, never adopted (the shared `abortStartRef` was reset by B).
+- **a stale response does not wipe events buffered for the newer command**.
+- **only the latest ask is adopted; the stale one's session is cancelled** — overlapping asks in
+  reverse resolution order.
+- **a stale ask failure shows no error over the newer answer**.
+- **two fast text-size clicks step twice, applied in click order** — quick patches are
+  serialized and font steps start from the last requested size.
+- **a re-delivered delta (same seq) is not painted twice, even when the answer errors** — `seq`
+  dedup; the `session:error` path has no `llm:done` to repair duplicates (§8 R07).
+- **events without seq are still accepted (older core)**.
+- **an answer streaming past 20 s survives: a delta disarms recovery** (R08).
+- **an Ask accepted after a refused stop is not killed by the old timer** — the §7/§8 later-Ask
+  case; recovery is session-scoped.
+- **recovery cancels the core session so UI and core agree** (§8 R08: recovery used to drop only
+  the UI's tracking).
+- **asks the core first and keeps waiting while it reports the session alive** — `get_status`
+  replaces the silence guess when available; a session no longer reported live is recovered.
+- **the global hotkey stops a recording running behind Settings** / **Settings shows the
+  recording and a Stop & Answer button** — Stop stays reachable (§4).
+- **shows Finalizing in the strip instead of a dead Record button** (§5 prompter status).
+- **marks a truncated answer, keeping its text and Copy / marks a refused answer / says nothing
+  for a complete or unstamped answer** — `llm:done.finish` from the R03 contract (CONTRACT §4).
+
+##### src/__tests__/app-drafts.test.tsx — Settings draft safety (R09) — 9 tests
+- **repeated Escape keeps the draft and the Settings view** — the R09 reproduction.
+- **repeated Back keeps the draft too** — only the explicit Discard discards.
+- **'Save and go back' saves, then leaves** / **…stays put, draft intact, when the save fails**.
+- **serializes saves and makes the form read-only while one is in flight** — visible "Saving…",
+  a second click sends nothing, edits cannot be overwritten by the response.
+- **a key typed after Remove wins over the queued removal** / **Undo remove cancels a queued
+  removal** (§7/§8 R09).
+- **Add and Duplicate are disabled at the core's 20-profile limit** / **Duplicate keeps the
+  copy's name within the 60-character limit** — the core rejects the whole save otherwise.
+
+##### src/__tests__/bridge.test.ts — readiness wait — 3 tests
+- **many early calls share ONE ready listener, and all resolve once ready** — the 3 s heartbeat
+  used to add a never-firing `pywebviewready` listener per tick while the bridge was absent.
+- **a command answers OFFLINE instead of hanging when the bridge never appears** (R11: bounded
+  `whenReady`).
+- **getStatus reports 'no status command' for an older core**.
+
+#### Follow-up additions (contract §5–13)
+
+##### src/__tests__/app-races.test.tsx — recording countdown (3 more tests)
+- **follows the core's deadline, not the local tick** — session:recording.deadlineMs drives
+  "x left" (the local tick starts before the device opens and drifts).
+- **ignores a deadline for another session**.
+- **falls back to the local tick when the core sends no deadline**.
+
+##### src/__tests__/format.test.ts (1 more test)
+- **title includes the audio drain stage when the core reports it** — optional udioDrainMs.
+
+##### src/__tests__/app-contract.test.tsx — shell/release contract (§8–12) — 11 tests
+- **version chip comes from the single version source** — 
++__APP_VERSION__, no literal.
+- **sends the revision the draft was built on, then advances it** — aseRevision on Settings saves.
+- **a stale-revision rejection reloads settings, says so, and keeps the draft** — nothing lost;
+  the next save is built on the fresh revision.
+- **an older core without settingsRevision gets no baseRevision**.
+- **warns next to a key stored without encryption** — keyStorage: plaintext.
+- **says when the settings file could not be read, naming the backup** (main view and Settings) /
+  **is silent for a normal or first-run file**.
+- **guards while the draft is dirty, prompts on a cancelled close, releases on Discard** —
+  set_close_guard + window:close-requested.
+- **core:failed shows a persistent alert; core:ready clears it** / **an older core event cannot
+  undo a newer one** / **a failed core from the load snapshot shows the alert in the prompter too**.
+
+### LLM answer path: completion validation, stale cleanup, secrets
+
+
+#### Changed existing entries
+
+- tests/test_providers.py **test_mid_stream_drop_is_stream_drop_kind** — the body now carries
+  only a text delta before the drop (no terminal event): Anthropic now stops reading at
+  `message_stop`, so a completed body would never reach the drop.
+- tests/test_providers.py **test_truncated_stream_flushes_last_words** (Groq) — the unterminated
+  final line is still flushed and its words still reach the panel, but a stream with neither
+  `finish_reason` nor `[DONE]` now raises `incomplete` instead of passing as a finished answer.
+- tests/test_providers.py **test_404_gives_an_actionable_message_never_an_edit_the_source_one**
+  (renamed from test_404_points_at_the_pinned_model_constant) — the Groq 404 message names the
+  model and tells the user to switch to Claude in Settings or update the app; it must never
+  mention a source file or constant (R13).
+- tests/test_retry.py `run()` reads `AnswerResult.text` (stream_answer now returns AnswerResult).
+
+#### New tests
+
+##### tests/test_providers.py — TestProviderCompletionValidation (R03, 9 tests × 2 providers)
+
+End to end through `stream_answer` over MockTransport, parameterized over Anthropic and Groq:
+
+- **test_error_event_before_any_text_fails_and_is_not_retried** — an error event inside an
+  HTTP 200 stream is `provider_error`, classified `llm_http` with the provider's message; the
+  server heard us, so exactly one request.
+- **test_error_event_after_text_fails_and_keeps_the_partial** — the painted partial stays, the
+  outcome is a failure, never a partial "success"; no retry after a delta.
+- **test_valid_but_empty_output_is_an_error_not_a_blank_success** — a properly terminated stream
+  with no text is `empty_answer` (it used to be a finished blank entry).
+- **test_whitespace_only_output_is_an_empty_answer** — whitespace is not usable text.
+- **test_clean_but_premature_eof_is_incomplete** — EOF without the terminal event (even with the
+  SSE final-line flush delivering the last words) is `incomplete`, "stopped before … finished".
+- **test_token_limit_completion_is_reported_as_truncated** — `max_tokens` / `length` completes
+  with `finish="truncated"` and the text intact.
+- **test_empty_output_at_the_token_limit_says_so** — the empty-answer message says the length
+  limit was hit.
+- **test_refusal_is_reported_as_refused** — `refusal` / `content_filter` → `finish="refused"`.
+- **test_normal_completion_is_complete** — `end_turn` / `stop` → `finish="complete"`, deltas
+  byte-identical to the answer.
+
+##### tests/test_providers.py — TestProviderSpecificCompletion
+
+- **test_anthropic_ping_only_stream_is_incomplete_not_success** — `ping` data lines flip the
+  transport's "produced" flag; completion still requires `message_stop`.
+- **test_anthropic_message_stop_without_message_delta_is_complete** — a missing stop_reason is
+  not an error.
+- **test_anthropic_context_window_stop_is_truncated** — `model_context_window_exceeded` counts
+  as truncation.
+- **test_anthropic_overloaded_and_rate_limit_stream_errors_map_like_http** — in-stream
+  `overloaded_error` / `rate_limit_error` get the same user copy/codes as HTTP 529/429.
+- **test_groq_finish_reason_without_done_is_complete** — either terminal signal suffices.
+- **test_groq_rate_limit_stream_error_maps_to_rate_limit** — in-stream rate limit →
+  `llm_rate_limit`.
+
+##### tests/test_providers.py — TestGroqSpecifics additions
+
+- **test_unterminated_final_done_line_still_flushes_and_completes** — the SSE flush feature is
+  kept: an unterminated final `data: [DONE]` still completes the answer.
+- **test_400_model_decommissioned_gets_the_same_actionable_message** — Groq's
+  `model_decommissioned`/`model_not_found` body on a 400 is treated as a retired model.
+- **test_other_400_is_not_misreported_as_a_retired_model** — a plain 400 keeps its status copy.
+- **test_finish_reason_helper** — `extract_openai_finish_reason` is an importable template piece.
+
+##### tests/test_providers.py — TestSecretsStayOutOfReprs
+
+- **test_request_repr_never_contains_the_key_or_profile** (× 2 providers) — `ProviderRequest`
+  headers (API key) and body (resume/profile) are `repr=False`; a repr in a traceback, pytest
+  output or log line must not leak them.
+
+##### tests/test_retry.py — TestAnswerResult
+
+- **test_a_provider_without_a_stream_end_is_trusted_as_complete** — third-party/fake providers
+  that yield bare strings keep working.
+- **test_stream_end_metadata_is_carried_into_the_result** — StreamEnd reaches AnswerResult and
+  never reaches the panel as a delta.
+- **test_no_text_is_an_empty_answer_failure_and_never_retried** — the post-condition that
+  replaced "return the concatenation even when empty".
+- **test_a_raising_on_delta_closes_the_provider_stream_immediately** — the provider generator
+  (and its HTTP response) is closed deterministically when the delta sink raises, not at GC.
+
+##### tests/test_warm.py — TestTaskOwnership
+
+- **test_an_in_flight_warm_is_strongly_held_until_it_finishes** — asyncio holds tasks weakly
+  and production callers drop the returned task; the warmer keeps a strong reference until the
+  warm finishes, then releases it.
+
+##### tests/test_machine.py — TestAnswerCompletion (R03 at the session boundary)
+
+- **test_done_reports_a_complete_finish** — `llm:done` carries `finish: "complete"`.
+- **test_a_token_limit_answer_is_done_but_marked_truncated** — truncation is a done with
+  `finish: "truncated"`, not an error.
+- **test_an_empty_answer_is_a_session_error_not_a_blank_done** — one `session:error`
+  (`llm_http`), no `llm:done`, slot released, no retry.
+- **test_an_in_stream_error_after_text_is_an_error_with_the_partial_painted** — the delta
+  stays painted, the terminal event is the error.
+
+##### tests/test_machine.py — TestStaleCommandCleanup (R04, backend half)
+
+- **test_a_late_aborted_start_leaves_the_newer_recording_untouched** — a start stalled on its
+  key read that resolves `aborted` after a newer start is recording installs nothing, stops no
+  audio, aborts no stream; the newer session still stops and answers.
+- **test_a_late_cancel_for_a_superseded_id_never_cancels_the_newer_session** — the frontend's
+  stale-success cleanup (`cancel(oldId)` sent after a newer start) is a no-op for the newer
+  session.
+
+#### Follow-up: public slot accessor
+
+##### tests/test_machine.py — TestActiveSnapshot
+
+- **test_it_tracks_the_live_slot_through_its_lifecycle** — `active_snapshot()` is None when
+  idle, reports id/kind/phase while recording and after Stop, and is None again once the
+  session is done and released.
+- **test_a_cancelled_session_reads_as_idle_and_the_copy_is_immutable** — the snapshot is a
+  frozen copy (callers cannot mutate machine state through it) and a cancelled session reads
+  as idle.
+
+Fakes updated to the accessor: test_bridge.py `FakeMachine.active_snapshot` (idle) and
+`SlotMachine.active_snapshot` (aborted slot reads as idle); test_app_wiring.py
+`ShutdownMachine.active_snapshot`.
+
+### Audio stop/drain and recording lifecycle
+
+
+#### tests/test_capture.py (NEW) — LoopbackCapture stop/drain contract, no device (R06)
+| Test | What it pins |
+| --- | --- |
+| `TestStopAndDrain::test_every_captured_sample_is_delivered[1,100,1600,2047,2048,5000]` | `stop_and_drain()` delivers every captured sample: full 2,048-sample frames, then one short final frame. Previously `stop()` cleared up to 2,047 samples (~128 ms), and a recording shorter than one frame delivered nothing. |
+| `TestStopAndDrain::test_the_in_flight_callback_lands_before_the_tail_and_close` | Capture cutoff = `stop_stream()` returning: a callback that PortAudio finishes inside `stop_stream` is included ahead of the remainder, and the stream is then closed. |
+| `TestStopAndDrain::test_nothing_is_delivered_after_the_cutoff` | A straggler chunk after the drain posts nothing. |
+| `TestStopDiscards::test_stop_discards_the_remainder` | `stop()` (cancel/supersede) keeps discard semantics. |
+| `TestStopDiscards::test_a_callback_after_stop_never_reaches_the_old_sink` | A late device callback after stop cannot post into any session's sink. |
+| `TestStopDiscards::test_a_failed_chunk_is_dropped_without_escaping` | An exception in chunk processing never escapes into PortAudio's C callback. |
+
+#### tests/test_machine.py — changed/added
+| Test | What it pins |
+| --- | --- |
+| `TestAudioRouting::test_frames_after_the_capture_cutoff_are_dropped` (replaces `test_frames_after_stop_requested_are_dropped`) | Rule 4 redefined: a frame queued before Stop is accepted; once the drain closes the cutoff, frames are rejected (they would race CloseStream). |
+| `TestAudioRouting::test_drained_tail_reaches_the_stream_before_finalize` | Order is audio, then the drained tail, then finalize (CloseStream last). |
+| `TestAudioRouting::test_drained_tail_during_connect_is_buffered_then_finalized` | Stop while connecting: the drained tail goes to the pre-open buffer and is finalized after the socket opens. |
+| `TestAudioRouting::test_cancel_discards_instead_of_draining` | Cancel uses the discard stop, never the drain. |
+| `TestMutationSurvivors::test_frames_after_the_cutoff_are_dropped_whatever_the_phase` (replaces `test_frames_arriving_between_stop_request_and_phase_flip_are_dropped`) | The `capture_closed` flag alone rejects a frame. |
+| `TestAudioLifecycle::test_a_known_drain_delay_is_counted_in_stop_to_first_token` | Review §8 criterion: a 400 ms fake-clock drain adds exactly 400 ms to `firstTokenMs`/`totalMs`, shows up as `audioDrainMs`, and is not folded into `sttFinalizeMs`. |
+| `TestAudioLifecycle::test_a_slow_device_open_does_not_block_the_loop_or_the_connect` | R10: the device open runs on the audio worker, and the STT handshake completes meanwhile. No cap and no `session:recording` until capture is running. |
+| `TestAudioLifecycle::test_a_slow_drain_does_not_block_the_loop_and_its_tail_precedes_finalize` | R10: a 300 ms blocking drain on a real worker thread leaves the loop responsive. Finalize waits for it, and the tail posted from the worker lands before finalize. |
+| `TestAudioLifecycle::test_a_hung_drain_is_bounded_and_the_answer_still_arrives` | `Timeouts.audio_drain_s` bounds a hung device stop. |
+| `TestAudioLifecycle::test_stop_while_the_device_is_still_opening_drains_after_the_open` | The single audio worker runs start, then drain. The device is never left open, and no cap is armed after Stop. |
+| `TestAudioLifecycle::test_the_cap_runs_from_capture_start_even_while_connect_hangs` | R10: the cap auto-stops even when Deepgram never finished connecting. It used to arm only after connect. |
+| `TestAudioLifecycle::test_recording_event_carries_one_core_deadline` | `session:recording {deadlineMs, capMs}` comes from the injected wall clock. |
+| `TestAudioLifecycle::test_a_device_open_failure_after_a_supersede_is_silent` | A device-open failure that lands after the session was superseded emits no error. |
+
+#### tests/conftest.py
+Adds `InlineExecutor`, which runs audio-worker calls synchronously so the suite stays deterministic; threaded tests pass a real `ThreadPoolExecutor` instead. Also adds `Harness(audio_executor=...)` and `FakeAudio.stop_and_drain`, with `tail`/`drain_delay_s`/`loop` knobs and a `drains` counter.
+
+### Shell, bridge and store
+
+
+Every entry below was checked against the pre-fix behavior. The R02, R05, R09, R11,
+late-start and R12 regressions were also mutation-checked: re-injecting the old code
+makes them fail (scratchpad/shell_mutation_check.py).
+
+#### tests/test_secrets.py — DPAPI fails closed (R02)
+
+- **test_keystore_unavailable_fails_closed** / **test_failing_keystore_fails_closed** —
+  replace the two tests that pinned the silent `plain:` fallback. `encode_secret` now
+  raises `SecretEncryptionError` when there is no keystore or `protect` raises, so no new
+  key is ever stored in a recoverable form while Settings says "encrypted".
+- **test_storage_kind_is_read_from_the_prefix** — `secret_storage` reports `enc:` as
+  "encrypted", legacy `plain:` as "plaintext", and anything else as None.
+
+#### tests/test_settings.py — TestEncryptionFailsClosed (R02)
+
+- **test_a_failed_encryption_refuses_the_save_and_keeps_the_old_key** — DPAPI fails during a
+  key replacement: the save raises "…NOT saved…", the file bytes are unchanged, the old key
+  still decodes, and the other field in the same patch (resume) was not applied either.
+- **test_saved_keys_report_how_they_are_stored** — the view's `keyStorage` shows
+  "encrypted" for a newly saved key (never key material).
+- **test_a_legacy_plaintext_key_is_reported_and_migrated_on_save** — a `plain:` key from an
+  older build still decodes (not lost on upgrade), is reported as "plaintext", and is
+  re-encrypted by the next successful save of any field.
+- **test_a_legacy_key_that_cannot_be_reencrypted_keeps_value_and_true_status** — when DPAPI
+  still fails, an unrelated save succeeds, the legacy key keeps working, and it is still
+  reported as "plaintext". Migration is never implied because some other field saved (§8).
+
+#### tests/test_settings.py — TestUnloadableFilePreservation (R05)
+
+- **test_a_geometry_save_backs_up_a_corrupt_file_before_replacing_it** — the untouched-launch
+  data loss: invalid JSON, then an automatic `set_window_bounds`. The original bytes are now in
+  exactly one `settings.json.invalid-<stamp>-<id>.bak` before the file is replaced, the view
+  reports `settingsFile` = {load: invalid, backup: <name>}, and later writes add no more backups.
+- **test_if_the_backup_cannot_be_made_nothing_is_overwritten** — the backup write fails: the
+  geometry save stays silent, a user save raises "…NOT overwritten…", and the original bytes
+  (invalid UTF-8 here) survive. Once the backup can be written, the next save preserves the file
+  and then writes.
+- **test_an_unreadable_file_is_distinguished_and_preserved** — a read error at startup (sharing
+  violation) loads as "unreadable", not as a first run. The still-valid file is copied to a
+  `.unreadable-` backup before the first write.
+- **test_a_file_still_unreadable_at_write_time_is_not_overwritten** — if the bytes still cannot be
+  read when the first write comes, they cannot be preserved, so the write is refused.
+- **test_a_missing_file_is_a_first_run_with_no_backup** / **test_a_valid_file_reports_ok_and_is_never_backed_up**
+  — the three load states stay distinct, and only unloadable files are backed up.
+- **test_backup_names_never_collide** — two stores backing up in the same second get distinct
+  names (timestamp plus a random suffix, opened with `xb`, so nothing is ever overwritten).
+
+#### tests/test_settings.py — TestSaveRevision (R09 backend)
+
+- **test_each_save_advances_the_revision** — `settingsRevision` counts successful patches.
+  Geometry saves do not count.
+- **test_a_stale_whole_profile_save_cannot_overwrite_a_newer_one** — two saves built on the same
+  `baseRevision` are applied in reverse submission order. The late, older one is rejected with
+  "…newer save…" and version B stays in memory and on disk. The lock and atomic replace
+  prevent torn files but did not prevent this stale write.
+- **test_a_malformed_base_revision_is_rejected** — strings, booleans, null and floats are refused
+  and nothing is applied.
+- **test_saves_without_a_base_revision_keep_last_write_wins** — patches without a precondition
+  (quick settings) behave as before.
+
+#### tests/test_bounds.py — title bar reachability and plan_restore (R12)
+
+- **TestTitleBarReachability** — a window whose body overlaps a display while its title bar
+  sits above it is no longer "visible" (the old 40 px overlap test kept it). A maximized frame's
+  -8 px offset, an oversized window with a reachable title bar, and a display above the primary
+  (negative y) are all still restored.
+- **TestPlanRestore** — the pure decision used by startup and layout switches: a position on any
+  connected display is restored; an unplugged display docks on the preferred display at the saved
+  size; with no preferred display the primary is used; with no display information at all the
+  mode's size is still applied (position None); a preferred display is honored even when
+  enumeration returned nothing.
+
+#### tests/test_app_wiring.py — shell additions
+
+- **TestRendererWatchdog** (updated) — pages are marked booted via `booted()`. After a reload the
+  page must load (or outlive the boot grace) before it can be judged again.
+- **TestWatchdogBootGate** (R11) — a page that was never shown is never probed, however old the
+  construction-time heartbeat is. A booting page 30 s after `shown` is neither probed nor
+  reloaded. A boot that never completes is recovered after `BOOT_GRACE_S`. A reloaded page gets
+  a fresh grace period (the old code reloaded it again mid-boot 20 s later). The first
+  `heartbeat()` counts as booted.
+- **TestStatusAndStartupFailure** (R01/R11) — protection starts "unknown". A verdict updates the
+  `get_status()` snapshot, and its push event carries the same `revision` and the tri-state value.
+  A newer verdict gets a higher revision and a repeat keeps it. A core build that raises (httpx
+  import blocked) is reported as `core:failed` with the snapshot revision, and `start_session`
+  then fails at once with "failed to start" instead of waiting 25 s. A built core emits
+  `core:ready`. `loaded` bumps the event page generation and clears a dead page's close guard.
+- **TestShutdown** — window close: the live session is cancelled, which queues its capture stop
+  on the app-owned audio worker. The shared HTTP client is closed, the worker drains that stop
+  and is shut down, and the core loop stops. A hung device call returns an unclean verdict
+  within the budget, so `main()` can exit hard instead of joining a non-daemon thread forever.
+  Exiting before the core was built is clean.
+- **TestCloseGuard** (R09 native close) — with no guard the window closes. With the guard set
+  and a live page, the first close is cancelled (`closing` handler returns False to pywebview)
+  and `window:close-requested` is emitted, and the second attempt closes. A stale page or a page
+  that never booted cannot hold the close.
+- **TestDockingAndLayoutSwitch** (updated + R12) — `_dockable` now pins every work area. Full
+  geometry saved on display A is restored exactly while the prompter sits on display B (the old
+  code docked it on B). An unplugged display docks on the current one at the saved size. With no
+  display information the mode's size is still applied (the old code returned without placing).
+
+#### tests/test_bridge.py — shell additions
+
+- **test_a_failed_core_releases_a_waiting_command_at_once** (R11) — a start already waiting on
+  the core returns immediately with the startup failure when `_core_failed` fires.
+- **TestStatusSnapshot** (R01) — the snapshot shape before the core exists is JSON-able. The
+  revision moves only when a field changes. Machine phases map to page phases, and aborted/done
+  slots read as idle. A wedged loop reports session phase "unknown" instead of hanging.
+  Core failure appears in the snapshot with its revision.
+- **TestLateCommandResults** — a start or ask that completes after the 30 s bridge deadline used to
+  leave a session running while the page was told the command failed; `future.cancel()` cannot
+  stop a coroutine that already finished. Now exactly that late session is cancelled. An
+  on-time start is never reaped.
+- **TestShellCommands** — `open_external` rejects host-less, whitespace, control-character and
+  oversized https URLs before they reach the OS shell. `set_close_guard` accepts only a real
+  `true`. `heartbeat()` marks the page booted.
+- **TestSaveSerialization** (R09) — a save and its window/hotkey hook complete before the next
+  save's patch starts. Before, a slow layout switch from save 1 could land after save 2.
+- **TestBoundedDelivery** (R07) — every payload carries `seq` and `pageGen`. `audio:level`
+  coalesces latest-wins per session, keeping its session id and its original position and seq.
+  The queue bound sheds levels first, then interim partials, then deltas, never reserved
+  events, and never reorders. After a timed-out batch the terminal event is re-sent with the
+  same seq, while its deltas are not re-sent, so a late execution of the abandoned call cannot
+  show them twice. A permanently hung renderer never gets more than `MAX_HUNG_DISPATCHES`
+  threads, and its terminal event stays queued.
+
+#### tests/test_hotkey.py
+
+- **test_a_registration_that_finishes_after_the_wait_is_undone** — `RegisterHotKey` outlasting
+  `register()`'s wait (a loaded machine) used to leave an untracked thread holding the key in a
+  message loop nothing could stop. Now the late success is unregistered, and the late thread can
+  no longer overwrite `_thread_id` for a newer registration.
+
+### Release metadata
+
+#### tests/test_release_metadata.py — one version, every dependency pinned (R13)
+
+Stdlib-only checks over `tools/release_meta.py`; no build, no network.
+
+- **test_repository_release_metadata_is_consistent** — the real repository
+  passes `release_meta.check()`: `frontend/package.json`, both root
+  versions in `frontend/package-lock.json`, `installer.iss`'s
+  `#define AppVersion` and any literal `vX.Y` UI chip agree with
+  `pyproject.toml`, and every dependency declared in pyproject is pinned in
+  `constraints.txt`. Why: before R13 the lockfile still said 3.0.0 and
+  pyproject declared no dependencies at all, so CI and a developer machine
+  could test different sets.
+- **test_version_is_semver_and_four_part_for_the_exe_resource** — the
+  version parses as MAJOR.MINOR.PATCH and maps to the four-part tuple the
+  Windows `VS_FIXEDFILEINFO` resource needs (`aica.spec` uses it).
+- **test_check_reports_version_drift[package.json|lockfile|installer]** —
+  on a temporary copy, changing ONE place's version produces exactly one
+  problem naming that file. Why: the check must fail loudly on drift, not
+  just pass on the happy path.
+- **test_ui_chip_may_abbreviate_but_not_disagree** — a `vX.Y` chip that is
+  a prefix of the version passes; a chip with a different minor fails.
+  Why: Settings hard-coded `v3.1`; a bump that forgets it must fail CI.
+- **test_check_reports_an_unpinned_dependency** — removing the
+  `websockets` pin from a copy of constraints.txt is reported. Why:
+  declared-but-unpinned dependencies silently float.
+- **test_build_info_records_revision_and_pins_without_secrets** — the
+  `build_info.json` payload the spec bundles has the version, a revision,
+  the pins, is JSON-serializable, and contains nothing key-like.
+- **test_spec_and_installer_take_the_version_from_one_source** — static:
+  `aica.spec` builds its version resource from `release_meta.read_version()`
+  and bundles `build_info.json`; `installer.iss` uses `{#AppVersion}` for
+  `AppVersion` and the output name, and stays `PrivilegesRequired=lowest`.
+
+### Release-review fixes (independent review, 2026-09-22)
+
+- tests/test_bridge.py **TestBoundedDelivery::test_a_reloaded_page_gets_deliveries_again_after_the_old_one_hung** —
+  the abandoned-dispatch count is kept per page generation. A call against a crashed WebView2
+  page may never return, so a global count ratcheted the pump shut for good after two crashes;
+  the reloaded, healthy page then never got another event.
+- tests/test_bridge.py **TestBoundedDelivery::test_a_permanently_hung_renderer_does_not_pile_up_threads**
+  (changed) — polls for the held terminal event instead of sampling once at 0.5 s, which raced
+  a dispatch attempt under a loaded suite.
+- tests/test_app_wiring.py **TestWatchdogBootGate::test_a_watchdog_reload_advances_the_generation_exactly_once** —
+  the watchdog advances the page generation before `load_url`, and the following `loaded` must
+  not advance it again. A dispatch stamped in the load window runs on the new page, and a second
+  bump made that page drop it, including terminal events.
+- tests/test_app_wiring.py **TestGeometryPersistence::test_close_flushes_the_pending_debounced_save**
+  (changed) — asserts the timer's `finished` flag (set by `cancel()` at once) instead of
+  `is_alive()`, which raced the timer thread's exit.
+- tests/test_bridge.py **TestStatusSnapshot::test_the_page_cannot_set_the_protection_verdict** —
+  pywebview exposes every public `js_api` method to page JS; the verdict setter is private so
+  only the Windows read-back can mark the window protected.
+- tests/test_machine.py **TestAudioLifecycle::test_a_device_open_failure_after_an_early_stop_is_reported_not_no_speech** —
+  no output device plus a Stop inside the open window reports "Could not open the system audio
+  device", not "No speech detected".
+- src/__tests__/app-races.test.tsx **an 'unknown' status (stalled core loop) waits again instead of cancelling** —
+  refused-stop recovery treats `phase: "unknown"` as "cannot tell" and rechecks (bounded)
+  instead of cancelling a session that may be mid-answer.

@@ -139,14 +139,17 @@ that was just asked.
 
 `app_core/store/secrets.py` is the whole story, and it is short:
 
-- Stored values are `enc:<base64 DPAPI blob>` — current-user scope, so
-  *another* user on the same machine cannot decrypt them — or, when the
-  keystore is unavailable, `plain:<base64>`: a **marked** fallback,
-  honestly labeled, still functional. Base64 is encoding, not
-  protection; the prefix says so.
+- New values are always `enc:<base64 DPAPI blob>` — current-user scope,
+  so *another* user on the same machine cannot decrypt them. When the
+  keystore is unavailable or refuses, `encode_secret` RAISES
+  `SecretEncryptionError` and the settings save fails visibly with the
+  previous key untouched. (Until 2026-09 it silently wrote a marked
+  `plain:<base64>` fallback while the UI said "encrypted" — review
+  finding R02.)
 - **Decoding goes by the stored prefix**, not by current keystore
-  availability. A `plain:` value saved before DPAPI came back still
-  decodes; deciding by availability instead would break it.
+  availability. A legacy `plain:` value written by an older build still
+  decodes, is reported to the UI as not encrypted, and is re-encrypted by
+  the next successful save.
 - **Fail closed.** A blob from another machine, invalid base64, an
   unknown prefix, a non-string — all read as `None`, "unset". The raw
   stored string is never handed to a provider, and the UI nudges for a
@@ -225,9 +228,10 @@ Say these out loud rather than discovering them:
   read `settings.json` (resume included), can edit `frontend/dist` on
   disk, and can unset the display affinity. This app does not and cannot
   defend against local malware; that is the OS account boundary's job.
-- **The `plain:` fallback is not encryption.** No keystore means marked
-  base64. The app stays functional and the prefix is honest — that is
-  the whole guarantee.
+- **Legacy `plain:` values are not encryption.** A key an older build
+  stored as marked base64 stays readable to anyone with the file until
+  the next successful save re-encrypts it. Profile text (resume, JD,
+  notes) is never encrypted at all.
 - **The providers themselves.** Call audio goes to Deepgram; the resume,
   job description, and transcript go to Anthropic or Groq over TLS.
   Their retention and handling are governed by their terms, not this

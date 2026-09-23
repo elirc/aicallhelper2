@@ -26,7 +26,9 @@ describe("Record during each phase", () => {
     await renderApp();
     fireEvent.click(screen.getByRole("button", { name: "Record" }));
     await settle();
-    expect(screen.getByText("Opening the microphone feed…")).toBeInTheDocument();
+    // System OUTPUT is captured, never a microphone — the copy must say so.
+    expect(screen.getByText("Starting system-audio capture…")).toBeInTheDocument();
+    expect(screen.queryByText(/microphone/i)).toBeNull();
     expect(screen.getByLabelText("Type a question")).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
@@ -53,7 +55,10 @@ describe("Record during each phase", () => {
     fireEvent.click(screen.getByRole("button", { name: "Stop & Answer" }));
     await settle();
     expect(screen.getByText("Finalizing transcript…")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    // The button says what is happening instead of a Record it will ignore.
+    const button = screen.getByRole("button", { name: "Finalizing…" });
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(button);
     await settle();
     expect(api.start_session).toHaveBeenCalledTimes(1); // ignored
     expect(screen.getByText("Finalizing transcript…")).toBeInTheDocument();

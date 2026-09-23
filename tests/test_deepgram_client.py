@@ -58,6 +58,18 @@ class Recorder:
         self.errors.append(err)
 
 
+async def wait_until(
+    predicate: Callable[[], bool], why: str, timeout: float = 3.0
+) -> None:
+    """Poll `predicate` until true or fail with `why`. Timing tests must wait
+    for the condition, never for a fixed number of milliseconds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, why
+        await asyncio.sleep(0.01)
+
+
 def make_stream(url: str, rec: Recorder, **kwargs: float) -> DeepgramStream:
     return DeepgramStream("test-key", rec.on_update, rec.on_error, url=url, **kwargs)
 
@@ -319,7 +331,11 @@ class TestKeepalive:
             rec = Recorder()
             stream = make_stream(box.url, rec, keepalive_interval=0.05)
             await stream.connect()
-            await asyncio.sleep(0.18)  # several keepalive periods of silence
+            # Several keepalive periods of silence — waited for, not slept
+            # for: fixed budgets are flaky under the Windows proactor.
+            await wait_until(
+                lambda: messages.count("KeepAlive") >= 2, "keepalives never arrived"
+            )
             await stream.finalize()
             keepalives_before_close = messages[: messages.index("CloseStream")].count(
                 "KeepAlive"
@@ -463,7 +479,7 @@ class TestProductionWireConstants:
             rec = Recorder()
             stream = DeepgramStream("secret-dg-key", rec.on_update, rec.on_error, url=box.url)
             await stream.connect()
-            await asyncio.sleep(0.15)
+            await wait_until(lambda: bool(seen), "the handshake never reached the server")
             assert seen and "token" in seen[0] and "secret-dg-key" in seen[0]
         finally:
             box.server.close()
@@ -486,7 +502,12 @@ class TestProductionWireConstants:
             rec = Recorder()
             stream = make_stream(box.url, rec, keepalive_interval=0.05, finalize_timeout=0.3)
             await stream.connect()
-            await asyncio.sleep(0.16)
+            # Wait for the keepalives rather than sleeping a fixed budget: the
+            # Windows proactor quantises timers to ~16 ms and overshoots under
+            # load, which made a 0.16 s budget flaky on slow machines.
+            await wait_until(
+                lambda: messages.count("KeepAlive") >= 2, "keepalives never arrived"
+            )
             await stream.finalize()
             await asyncio.sleep(0.25)  # several more keepalive periods
             assert "CloseStream" in messages
@@ -544,5 +565,38 @@ class TestCloseStreamUnderBackpressure:
             assert order, "nothing reached the server"
             assert order[-1] == "close", order[-3:]
             assert order[:12] == [f"audio:{i}" for i in range(12)]
+        finally:
+            box.server.close()
+
+
+class TestAbortDuringHandshake:
+    async def test_abort_before_the_socket_opens_closes_it_on_arrival(self) -> None:
+        """abort() with the handshake in flight: the socket that opens a
+        moment later belongs to nobody. It must be closed at once — not
+        left with reader/keepalive tasks pinning it open — and its close
+        must not be reported."""
+        server_closed = asyncio.Event()
+        got_close_code: list[int | None] = []
+
+        async def handler(ws: ServerConnection) -> None:
+            try:
+                async for _message in ws:
+                    pass
+            finally:
+                got_close_code.append(ws.close_code)
+                server_closed.set()
+
+        box = await serve(handler)
+        try:
+            rec = Recorder()
+            stream = make_stream(box.url, rec)
+            connecting = asyncio.get_running_loop().create_task(stream.connect())
+            await stream.abort()  # runs before connect() has done anything
+            await connecting
+            await asyncio.wait_for(server_closed.wait(), timeout=3.0)
+            assert got_close_code == [1000]
+            assert rec.errors == []
+            assert stream._tasks == [], "reader/sender/keepalive spawned on a dead stream"
+            assert await stream.finalize() == ""  # nothing to wait for
         finally:
             box.server.close()

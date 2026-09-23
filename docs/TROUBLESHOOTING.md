@@ -9,7 +9,7 @@ the real status the provider returned, not a guess.
 ## Nothing happens when I press Record / no transcript appears
 
 What it looks like: you press Record, and either an error box appears, the
-status sticks at "Opening the microphone feed…", or recording starts but
+status sticks at "Starting system-audio capture…", or recording starts but
 the "Question heard" panel stays on "Listening…".
 
 Check in this order:
@@ -36,8 +36,10 @@ Check in this order:
    below; the hint appears on its own after ~5 s.
 
 Note the app captures what plays through your DEFAULT OUTPUT device
-(WASAPI loopback), not your microphone. It transcribes the other person's
-voice as your speakers render it.
+(WASAPI loopback) and never opens your microphone. It captures EVERYTHING
+that device plays — the other person's voice, but also notifications, music,
+or any other app's audio — and all of it is sent to Deepgram for
+transcription while you record.
 
 ## "No speech detected in the recording" at Stop
 
@@ -102,20 +104,37 @@ works regardless of hotkey status.
 
 ## The screen-capture warning appears
 
-Text: "Windows would not hide this window from screen capture, so it may
-be visible if you share your screen."
+The protection status is shown in every view (full window, prompter strip
+and Settings) as one of three states (`frontend/src/components/ProtectionNotice.tsx`):
+
+- **"Hidden from screen capture"** — Windows reported the exclusion as set.
+- **"Screen-share protection not confirmed yet"** — Windows has not
+  answered yet (normal for a moment at startup or after a page reload).
+  Do not share your screen until it changes.
+- **Alert: "Windows would not hide this window from screen capture, so it
+  may be visible if you share your screen."** (in the prompter: "Not hidden
+  from screen share — Windows refused to protect this window.")
 
 The app sets `WDA_EXCLUDEFROMCAPTURE`, then READS THE AFFINITY BACK and
-tries up to 5 times (`app_core/bridge/protection.py`, applied from
-`app.py`). This warning means the OS never confirmed the exclusion — it is
-a verified fact, not a maybe. Treat the window as visible in any share.
+retries (`app_core/bridge/protection.py`, applied from `app.py`). The alert
+means the OS never confirmed the exclusion. Treat the window as visible in
+any share.
 
 Causes: Windows 10 builds older than 2004, which lack
 `WDA_EXCLUDEFROMCAPTURE` entirely; a policy or graphics driver that
 refuses it. Fix: update Windows. There is no in-app workaround — a user
 who believes they are hidden while being broadcast is this product's worst
 outcome, which is why the failure is a standing warning instead of a log
-line. Conversely: no warning means Windows confirmed the exclusion.
+line.
+
+"Hidden" is what Windows reports, not a guarantee for every capture
+method: Microsoft documents display affinity as protection against
+ordinary screen capture, and a capture path that ignores it (some
+hardware capture, remote-desktop setups, a phone camera pointed at the
+screen) still sees the window. Check the call app and sharing mode you
+actually use once before an important call; the release checklist
+(`fabledocs/RELEASE-CHECKLIST.md`) lists the combinations verified for a
+release.
 
 ## Auth errors, per provider
 
@@ -150,31 +169,71 @@ refuses a key containing smart quotes or hidden characters at save time
 ("API keys must be plain ASCII…"), because a non-ASCII key would otherwise
 fail uselessly mid-answer inside an HTTP header.
 
-## "Groq returned 404 — the model may have been retired"
+## "Groq no longer offers the model this version of the app uses"
 
-Full text: "Groq returned 404 — the model may have been retired (Groq
-retires models on short notice). Update the pinned model constant in
-app_core/llm/groq.py."
+Full text: "Groq no longer offers the model this version of the app uses
+(openai/gpt-oss-120b); Groq retires models on short notice. Switch the
+answer provider to Claude in Settings, or install the latest version of the
+app."
 
-The model is pinned in ONE constant — `MODEL = "openai/gpt-oss-120b"` in
-`app_core/llm/groq.py` — precisely so this failure has a one-line fix.
-Check Groq's current model list, update the constant, rebuild. Until then,
-switch the answer provider to Anthropic in Settings and keep working.
+Shown for a Groq 404, or a 400 whose body says the model is gone
+(`app_core/llm/groq.py`). **Users:** switch the answer provider to Claude
+in Settings and keep working; update the app when a new version is out.
+**Maintainers:** the model is pinned in ONE constant, `MODEL` in
+`app_core/llm/groq.py`. Check Groq's current model list, update the
+constant, run the gates and the live Groq smoke test from
+`fabledocs/RELEASE-CHECKLIST.md`, and ship a new release.
+
+## The answer ends with an error instead of text
+
+HTTP 200 is not treated as success on its own. The provider adapters check
+the provider's own end-of-answer signal (Anthropic `message_stop`; Groq
+`finish_reason` / `[DONE]`), so these now surface as errors rather than as a
+blank or silently cut-off answer:
+
+- "Anthropic/Groq reported an error during the answer. …" — the provider
+  sent an error event inside an otherwise successful stream (for example
+  Anthropic's `overloaded_error`). Try again in a moment.
+- "The answer stopped before … finished it (the stream ended early). Try
+  again." — the connection ended before the provider's terminal event. Any
+  text that already streamed stays visible.
+- "… finished without writing an answer. Try again." / "… hit its length
+  limit before writing any answer text." / "… declined to answer this one.
+  Try rephrasing the question." — the stream finished but contained no
+  usable text; the reason is in the wording.
+
+None of these is retried automatically once text has reached the screen
+(a second attempt would splice two answers). An answer that DID produce
+text but hit the 1,024-token limit is kept, and `llm:done` reports
+`finish: "truncated"` for it.
 
 ## The answer is slow
 
 The latency chip on the answer ("X.Xs to first word") is the diagnostic.
-Hover it: "First word N ms after Stop · transcript finalized N ms · full
-answer N.N s" (`frontend/src/format.ts`). All three run from the Stop
-press; for typed questions the clock starts at submit and "transcript
-finalized" is exactly 0.
+Hover it for the breakdown (`frontend/src/format.ts`). The numbers come
+from `llm:done`'s `metrics` (`app_core/session/machine.py`):
+
+- `firstTokenMs` / `totalMs` run from the moment the core ACCEPTED Stop to
+  the first answer delta / the end of the answer. They deliberately include
+  the audio drain and device teardown, because the user waits for those.
+- `audioDrainMs` — Stop acceptance until every pre-Stop audio sample was
+  delivered and the capture device closed (bounded at 2 s).
+- `sttFinalizeMs` — drain complete until Deepgram's final transcript
+  (bounded at ~5 s).
+
+For typed questions the clock starts at submit and both `audioDrainMs` and
+`sttFinalizeMs` are 0. The numbers are measured in the core: bridge
+transit and rendering are not included, so the first word appears on
+screen slightly later than the chip says.
 
 Read it like this:
 
-- **"transcript finalized" dominates** (it can reach ~5000 ms — the cap):
+- **The drain dominates**: a slow audio device stop. Rare; note the device
+  in a bug report.
+- **Transcript finalization dominates** (it can reach ~5000 ms — the cap):
   Deepgram's end-of-stream flush is slow, usually your network path to
-  Deepgram. This cost is bounded at 5 s by the core.
-- **First word minus transcript-finalized dominates**: the LLM side. The
+  Deepgram.
+- **First word minus (drain + finalization) dominates**: the LLM side. The
   provider origin is pre-warmed at Record AND again at Stop so a pooled
   TLS connection should be waiting; a proxy, a network that drops idle
   connections, or provider-side load raises it. Groq is the "fastest"
@@ -189,10 +248,12 @@ again." and "The answer took longer than 60 seconds and was stopped."
 
 Related: if you press Stop at the same moment the 120 s cap fires, the
 status shows "Reached the 120s limit — answering now" and the answer still
-arrives — the frontend deliberately keeps waiting up to 20 s after a
-refused stop instead of cancelling a session that is mid-finalize
-(`STOP_RECOVERY_MS` in `frontend/src/App.tsx`). "Finalizing transcript…"
-that outlives that window recovers to idle on its own.
+arrives — the frontend keeps waiting after a refused stop instead of
+cancelling a session that is mid-finalize, and stops waiting as soon as the
+answer starts streaming (`frontend/src/App.tsx`). The 120 s cap is counted
+from the moment capture is actually running, and the core tells the page
+the deadline (`session:recording`), so the on-screen timer and the core's
+cap agree.
 
 ## The window opens in the wrong place, or geometry isn't remembered
 
@@ -231,23 +292,41 @@ If the app never starts:
   to a running Vite dev server). A missing dist is a blank window.
 - A white/frozen page mid-session heals itself: the frontend heartbeats
   every 3 s, and a watchdog reloads the page after 15 s of silence, at
-  most once per 10 s (`app.py`, `HEARTBEAT_STALE_S`).
+  most once per 10 s (`app.py`, `HEARTBEAT_STALE_S`). A stale heartbeat
+  alone is not enough: the watchdog first probes the page with a direct
+  `evaluate_js` and only reloads when that fails or hangs. Chromium
+  throttles timers in a hidden page (once per minute after five minutes
+  minimized), so a minimized window's heartbeat goes quiet while the page
+  is perfectly healthy — reloading it would wipe the history.
 
 ## Where the logs and settings live
 
 Everything is in `%APPDATA%\AICallAssistant\`:
 
-- **settings.json** — resume, job description, provider/style/hotkey
-  choices, window bounds, and API keys. Keys are stored DPAPI-encrypted
-  (`enc:` prefix, current-user scope); if DPAPI is ever unavailable they
-  fall back to an honestly-marked `plain:<base64>`. Copying settings.json
-  to another machine or user account makes `enc:` keys undecryptable —
-  they read as UNSET (fail closed, `app_core/store/secrets.py`), so the
-  app asks for keys again. Re-enter them; nothing else is lost.
-- **crash.log** (rotated to crash.log.1 past 1 MB at boot) — timestamped
-  tracebacks only: unhandled exceptions, thread exceptions, asyncio loop
-  failures, and faulthandler output on a hard crash (`app.py`,
-  `install_crash_logging`).
+- **settings.json** — profiles (resume, job description, focus, notes),
+  provider/style/hotkey choices, window bounds, and API keys. Profile text
+  is ordinary, unencrypted JSON. Keys are stored DPAPI-encrypted (`enc:`
+  prefix, current-user scope). If Windows cannot encrypt a key, the save
+  FAILS with "Windows could not encrypt the API key, so it was NOT saved…"
+  and the previously saved key is left unchanged — this version never
+  writes a new key in plaintext. Keys that an older build stored in its
+  marked `plain:<base64>` fallback still work and are re-encrypted on the
+  next successful save. Copying settings.json to another machine or user
+  account makes `enc:` keys undecryptable — they read as UNSET (fail
+  closed, `app_core/store/secrets.py`), so the app asks for keys again.
+  Re-enter them; nothing else is lost.
+- **settings.json.*.bak** — if settings.json exists but could not be read
+  or parsed at startup, the app runs on defaults and, before its first
+  write of any kind (including the automatic window-position save), copies
+  the original bytes to a uniquely named `.bak` file next to it. If that
+  copy cannot be made, the write is refused instead ("…a backup copy of it
+  could not be made, so it was NOT overwritten…"). Recover profiles or
+  keys from the `.bak` by hand.
+- **crash.log** — timestamped tracebacks only: unhandled exceptions,
+  thread exceptions, asyncio loop failures, and faulthandler output on a
+  hard crash (`app.py`, `install_crash_logging`). The size is checked ONCE
+  at startup: past 1 MB it is renamed to crash.log.1 (replacing the
+  previous one), so a single long session can grow it beyond 1 MB.
 
 crash.log deliberately never contains transcripts, answers, your resume or
 job description, or API keys — the app has no request or content logging;
@@ -260,7 +339,7 @@ attach to a bug report as-is.
    status, WebSocket close code, provider name).
 2. What the status line said and what you pressed, in order ("Recording
    call audio…" → Stop → stuck at "Finalizing transcript…" is a different
-   bug than never leaving "Opening the microphone feed…").
+   bug than never leaving "Starting system-audio capture…").
 3. `%APPDATA%\AICallAssistant\crash.log` (safe to share — see above).
 4. For slowness: the three numbers from the latency chip tooltip.
 5. For capture problems: your audio setup (default output device, headset
@@ -269,4 +348,54 @@ attach to a bug report as-is.
 6. For the screen-capture warning: your Windows version (`winver` —
    build 2004 is the floor for capture exclusion).
 7. Whether you ran the packaged exe or from source, and the app
-   version/commit.
+   version/commit. A packaged build records both in
+   `_internal\build_info.json` next to the exe (also: Properties →
+   Details on AICallAssistant.exe shows the version).
+
+
+## The prompter strip is on the wrong monitor, or too small to read
+
+The strip docks to the top-centre of **the display it is on**. Drag it onto
+the monitor with the webcam and press **⤒ Dock under camera**. Resize it
+freely (minimum 380x160); its size is remembered separately from the full
+window's. Use **A+** for larger text (up to 28 px). If the strip ever lands
+off-screen (a monitor was unplugged), relaunching docks it back on the
+primary display.
+
+## I ran an older build and my extra profiles disappeared
+
+Older builds read only the top-level `resume`/`jobDescription` keys, which
+this version keeps as mirrors of the **active** profile, and they rewrite
+the whole file on every window move — so an older build that saves keeps
+only the active profile. Restore the others from a backup of
+`%APPDATA%\AICallAssistant\settings.json` if you have one; otherwise
+re-create them in Settings. Don't run two builds against the same profile.
+
+## "The app is still starting up — try again in a moment"
+
+You pressed Record (or Ask) within the first seconds after launch. The
+window appears before the audio and network stacks have loaded; commands
+wait for them. If the core failed to load at all, commands say so
+directly instead: "The app core failed to start, so recording and answers
+are unavailable. Restart the app; details are in crash.log." Check
+`crash.log` for a `core:` entry — a failed import (for example a missing
+PyAudioWPatch in a source install) is logged there.
+
+## "Something went wrong inside the app core." (for example on Save)
+
+This is the catch-all for an unexpected exception or a command that
+timed out inside the core; it does NOT by itself mean antivirus. Check, in
+order: `crash.log` for a traceback at that time; that
+`%APPDATA%\AICallAssistant` is writable and not full; whether a Settings
+save reported a more specific message (encryption failure, profile limit,
+backup failure). Only if saves intermittently fail with a sharing or
+access-denied traceback in crash.log is real-time antivirus scanning of
+`settings.json` a candidate — test that by briefly pausing scanning, not
+by adding permanent broad exclusions.
+
+## Stop pressed right after Record seems to "do nothing" for a moment
+
+That is expected and safe: if you press Stop while the app is still
+connecting to Deepgram, the audio captured so far is kept and the transcript
+is finalized the instant the connection opens. (Older versions refused the
+stop and sat in "Finalizing…" for 20 s; that is fixed.)

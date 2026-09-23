@@ -8,7 +8,7 @@ import asyncio
 import httpx
 import pytest
 
-from app_core.llm.base import ProviderFailure, ProviderRequest
+from app_core.llm.base import AnswerResult, ProviderFailure, ProviderRequest, StreamEnd
 from app_core.llm.retry import stream_answer
 from tests.conftest import FakeProvider
 
@@ -22,8 +22,8 @@ async def run(provider: FakeProvider) -> tuple[str, list[str]]:
     request = provider.build_request(
         provider_prompt(), "key"
     )
-    answer = await stream_answer(provider, request, http_stub(), deltas.append)
-    return answer, deltas
+    result = await stream_answer(provider, request, http_stub(), deltas.append)
+    return result.text, deltas
 
 
 def provider_prompt() -> object:
@@ -102,3 +102,59 @@ class TestRetryOnce:
         assert len(seen) == 2
         assert seen[0] is seen[1]
         assert provider.requests_built == 1
+
+
+class TestAnswerResult:
+    """R03: stream_answer reports HOW the answer ended and never returns a
+    blank success."""
+
+    async def test_a_provider_without_a_stream_end_is_trusted_as_complete(self) -> None:
+        provider = FakeProvider()  # yields bare strings only
+        request = provider.build_request(provider_prompt(), "key")
+        result = await stream_answer(provider, request, http_stub(), lambda d: None)
+        assert result == AnswerResult("Hello world.", "complete", None)
+
+    async def test_stream_end_metadata_is_carried_into_the_result(self) -> None:
+        class Truncating(FakeProvider):
+            async def stream(self, request, http):  # type: ignore[override]
+                async for d in super().stream(request, http):
+                    yield d
+                yield StreamEnd("truncated", "max_tokens")
+
+        provider = Truncating()
+        request = provider.build_request(provider_prompt(), "key")
+        deltas: list[str] = []
+        result = await stream_answer(provider, request, http_stub(), deltas.append)
+        assert result == AnswerResult("Hello world.", "truncated", "max_tokens")
+        assert deltas == ["Hello ", "world."]  # the StreamEnd never reaches the panel
+
+    async def test_no_text_is_an_empty_answer_failure_and_never_retried(self) -> None:
+        provider = FakeProvider()
+        provider.deltas = []
+        request = provider.build_request(provider_prompt(), "key")
+        with pytest.raises(ProviderFailure) as info:
+            await stream_answer(provider, request, http_stub(), lambda d: None)
+        assert info.value.kind == "empty_answer" and info.value.finish == "complete"
+        assert provider.stream_calls == 1
+
+    async def test_a_raising_on_delta_closes_the_provider_stream_immediately(self) -> None:
+        # Without an explicit aclose the provider generator (and the HTTP
+        # response inside it) stays open until garbage collection.
+        closed: list[bool] = []
+
+        class Tracking(FakeProvider):
+            async def stream(self, request, http):  # type: ignore[override]
+                try:
+                    async for d in super().stream(request, http):
+                        yield d
+                finally:
+                    closed.append(True)
+
+        def boom(delta: str) -> None:
+            raise RuntimeError("sink failed")
+
+        provider = Tracking()
+        request = provider.build_request(provider_prompt(), "key")
+        with pytest.raises(RuntimeError):
+            await stream_answer(provider, request, http_stub(), boom)
+        assert closed == [True]

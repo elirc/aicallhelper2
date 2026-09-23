@@ -40,7 +40,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px 14px 16px;
+  padding: 10px 14px 16px;
   min-height: 100vh;
 }
 
@@ -63,7 +63,8 @@ body {
 .header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
 }
 
 .title {
@@ -71,6 +72,10 @@ body {
   font-weight: 600;
   margin: 0;
   flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .status-dot {
@@ -85,14 +90,30 @@ body {
   background: var(--ok-text);
 }
 
+.header-chip {
+  flex: none;
+  max-width: 40%;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: var(--bg-raised);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .icon-button {
   background: none;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-muted);
   font-size: 15px;
-  padding: 3px 8px;
+  line-height: 1;
+  padding: 4px 8px;
   cursor: pointer;
+  flex: none;
 }
 
 .icon-button:hover {
@@ -116,7 +137,7 @@ body {
 
 .record-button {
   flex: 1;
-  padding: 14px;
+  padding: 12px;
   font-size: 16px;
   font-weight: 600;
   color: #ffffff;
@@ -171,6 +192,55 @@ body {
   font-size: 12px;
 }
 
+/* The verdict chip every view carries (R01): muted when confirmed, caution
+   colour while Windows has not answered yet. */
+.protection-chip {
+  align-self: flex-start;
+  font-size: 11px;
+  color: var(--ok-text);
+}
+
+.protection-chip-unknown {
+  color: var(--warn-text);
+}
+
+/* Groups the Settings form so one `disabled` makes it read-only while a save
+   is in flight; `display: contents` keeps the existing column layout. */
+.settings-form {
+  display: contents;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.field-warn {
+  color: var(--warn-text);
+}
+
+.answer-finish-notice {
+  margin: 0;
+  padding: 4px 10px 8px;
+  font-size: 12px;
+  color: var(--warn-text);
+}
+
+.prompter-status {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.session-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
 .meter-row {
   display: flex;
   align-items: center;
@@ -197,6 +267,12 @@ body {
   font-size: 12px;
 }
 
+.timer-countdown {
+  font-variant-numeric: tabular-nums;
+  color: var(--warn-text);
+  font-size: 12px;
+}
+
 /* ------------------------------------------------------------------- ask */
 
 .ask-form {
@@ -206,6 +282,7 @@ body {
 
 .ask-input {
   flex: 1;
+  min-width: 0;
   background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -239,9 +316,28 @@ body {
   background: var(--accent-hover);
 }
 
+.context-row {
+  display: flex;
+  gap: 6px;
+}
+
+.context-row select,
+.compact-select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
 .style-chips {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .style-chip {
@@ -278,7 +374,8 @@ body {
 .panel-title {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   padding: 8px 12px 0;
 }
 
@@ -328,13 +425,16 @@ body {
 }
 
 .transcript-body {
-  max-height: 110px;
+  max-height: 96px;
   white-space: pre-wrap;
 }
 
 .answer-body {
   flex: 1;
-  max-height: 300px;
+  /* The window is docked under the camera; the answer must stay near the
+     top while the controls below stay reachable without a page scroll. */
+  max-height: min(48vh, 440px);
+  line-height: 1.5;
 }
 
 .placeholder {
@@ -345,15 +445,15 @@ body {
 .answer-body ul,
 .answer-body ol,
 .answer-body pre {
-  margin: 0 0 8px;
+  margin: 0 0 0.55em;
 }
 
 .answer-body h3,
 .answer-body h4,
 .answer-body h5,
 .answer-body h6 {
-  margin: 10px 0 6px;
-  font-size: 13px;
+  margin: 0.7em 0 0.4em;
+  font-size: 1em;
 }
 
 .answer-body pre {
@@ -366,7 +466,7 @@ body {
 
 .answer-body code {
   font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 12.5px;
+  font-size: 0.9em;
   background: var(--bg-inset);
   border-radius: 4px;
   padding: 1px 4px;
@@ -393,11 +493,19 @@ body {
 /* ---------------------------------------------------------------- errors */
 
 .error-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   background: rgba(224, 90, 90, 0.12);
   border: 1px solid var(--danger);
   color: var(--danger-text);
   border-radius: 8px;
   padding: 8px 12px;
+}
+
+.error-box > span {
+  flex: 1;
+  min-width: 0;
 }
 
 /* --------------------------------------------------------------- history */
@@ -426,6 +534,7 @@ body {
   font-size: 12px;
   padding: 3px 10px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .mini-button:hover:not(:disabled) {
@@ -438,6 +547,100 @@ body {
   cursor: not-allowed;
 }
 
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-text);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* -------------------------------------------------------------- prompter */
+
+.prompter {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 6px 10px 0;
+  gap: 4px;
+}
+
+.prompter-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  font-size: 12px;
+}
+
+.prompter-bar .record-button {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.prompter-bar .style-chip {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.prompter-bar .mini-button,
+.prompter-bar .icon-button {
+  padding: 2px 7px;
+  font-size: 12px;
+}
+
+.prompter-question {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.prompter-notice {
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn-text);
+}
+
+.prompter-notice-error {
+  color: var(--danger-text);
+}
+
+.prompter-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  position: relative;
+  padding: 4px 12px 16px;
+  line-height: 1.5;
+  max-height: none;
+}
+
+.prompter-column {
+  max-width: 64ch;
+  margin: 0 auto;
+}
+
+.prompter-more {
+  position: sticky;
+  bottom: 4px;
+  float: right;
+  font-size: 11px;
+  color: var(--accent-text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: var(--bg);
+}
+
 /* -------------------------------------------------------------- settings */
 
 .settings .field {
@@ -446,9 +649,18 @@ body {
   gap: 4px;
 }
 
-.settings .field > span:first-child {
+.settings .field > span:first-child,
+.settings .field-label > span:first-child {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* A label whose help text lives OUTSIDE it, so the accessible name of the
+   control stays exactly the visible label. */
+.settings .field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .settings input[type="text"],
@@ -479,6 +691,42 @@ body {
   color: #7b8496;
 }
 
+.field-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.field-row > input,
+.field-row > select {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-section {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-section h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.profile-toolbar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .settings-note {
   font-size: 12px;
   color: var(--text-muted);
@@ -486,14 +734,31 @@ body {
 }
 
 .settings-actions {
+  position: sticky;
+  bottom: 0;
   display: flex;
   align-items: center;
   gap: 10px;
+  padding: 10px 0 4px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
 }
 
 .saved-note {
   color: var(--ok-text);
   font-size: 13px;
+}
+
+.unsaved-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--warn-text);
+  border: 1px solid var(--warn-text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: rgba(240, 180, 90, 0.1);
 }
 
 @media (prefers-reduced-motion: reduce) {

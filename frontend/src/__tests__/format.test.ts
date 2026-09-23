@@ -27,6 +27,12 @@ describe("latency formatting", () => {
       "First word 940 ms after Stop · transcript finalized 210 ms · full answer 2.1 s",
     );
   });
+
+  it("title includes the audio drain stage when the core reports it", () => {
+    expect(formatLatencyTitle({ ...metrics, audioDrainMs: 35 })).toBe(
+      "First word 940 ms after Stop · audio drained 35 ms · transcript finalized 210 ms · full answer 2.1 s",
+    );
+  });
 });
 
 describe("formatHotkey", () => {

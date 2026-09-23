@@ -3,27 +3,50 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  core:
-    name: Core (ruff, mypy --strict, pytest)
-    runs-on: windows-latest
+  metadata:
+    name: Release metadata (one version, all deps pinned)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - name: Install dependencies
-        run: python -m pip install pywebview websockets httpx numpy pywin32 PyAudioWPatch pytest pytest-asyncio ruff mypy
+          python-version: "3.12"
+      # Stdlib only: runs before anything is installed.
+      - run: python tools/release_meta.py check
+
+  core:
+    name: Core (ruff, mypy --strict, pytest) on Python ${{ matrix.python }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 = declared minimum (pyproject requires-python, ruff/mypy target);
+        # 3.13 = the runtime the release exe is built with.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: constraints.txt
+      - name: Install dependencies (pinned; same command as local setup)
+        run: python -m pip install -c constraints.txt -e ".[dev]"
       - name: Ruff
-        run: python -m ruff check app_core app.py tests
+        run: python -m ruff check app_core app.py tests tools
       - name: Mypy (strict)
         run: python -m mypy
       - name: Pytest
         run: python -m pytest tests -q
 
   frontend:
-    name: Frontend (tsc strict, vitest)
+    name: Frontend (tsc strict, vitest, build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -37,9 +60,62 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
       - name: Typecheck
         run: npm run typecheck
       - name: Tests
         run: npm test
       - name: Build
-        run: npx vite build
+        run: npm run build
+
+  package:
+    name: Package (PyInstaller exe + Inno Setup installer)
+    runs-on: windows-latest
+    needs: [metadata, core, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: constraints.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Python dependencies incl. PyInstaller (pinned)
+        run: python -m pip install -c constraints.txt -e ".[build]"
+      - name: Install Inno Setup 6
+        run: choco install innosetup --no-progress -y
+      - name: Version
+        id: meta
+        shell: bash
+        run: echo "version=$(python tools/release_meta.py version)" >> "$GITHUB_OUTPUT"
+      - name: Frontend build
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+      - name: PyInstaller
+        run: python -m PyInstaller aica.spec --noconfirm
+      - name: Check the exe carries the version resource and build record
+        shell: pwsh
+        run: |
+          $exe = "dist\AICallAssistant\AICallAssistant.exe"
+          $v = (Get-Item $exe).VersionInfo.ProductVersion
+          if ($v -ne "${{ steps.meta.outputs.version }}") { throw "exe ProductVersion '$v' != ${{ steps.meta.outputs.version }}" }
+          Get-Content dist\AICallAssistant\_internal\build_info.json
+      - name: Installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.meta.outputs.version }}" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AICallAssistant-${{ steps.meta.outputs.version }}-${{ github.sha }}
+          path: |
+            dist/AICallAssistant-Setup-${{ steps.meta.outputs.version }}.exe
+            dist/AICallAssistant/
+          if-no-files-found: error
+          retention-days: 30

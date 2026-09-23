@@ -8,16 +8,20 @@ transport half of that template.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-
-import httpx
+from typing import TYPE_CHECKING
 
 from app_core.llm.base import ProviderFailure, ProviderRequest
 from app_core.llm.sse import SSEParser
 
+if TYPE_CHECKING:
+    import httpx
+
 # The session machine owns the first-token (10 s) and total (60 s) timeouts by
 # cancelling the stream task; these transport timeouts are only a backstop and
-# must sit ABOVE the machine's timers so they never fire first.
-REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=75.0, write=10.0, pool=10.0)
+# must sit ABOVE the machine's timers so they never fire first. Kept as plain
+# numbers: httpx is imported inside the function so that building the provider
+# registry (which the settings store needs at startup) never loads httpx.
+REQUEST_TIMEOUT_S = {"connect": 10.0, "read": 75.0, "write": 10.0, "pool": 10.0}
 BODY_SNIPPET_LEN = 400
 
 
@@ -31,6 +35,8 @@ async def stream_sse_data(
     started), "empty_body" (200 that produced no SSE data at all).
     asyncio.CancelledError propagates untouched — abort is control flow.
     """
+    import httpx  # deferred: see REQUEST_TIMEOUT_S
+
     response_started = False
     produced = False
     try:
@@ -39,7 +45,7 @@ async def stream_sse_data(
             request.url,
             headers=request.header_dict(),
             content=request.body,
-            timeout=REQUEST_TIMEOUT,
+            timeout=httpx.Timeout(**REQUEST_TIMEOUT_S),
         ) as response:
             response_started = True
             if response.status_code != 200:

@@ -1,0 +1,52 @@
+# Exact dependency versions that CI and local setup install and test against.
+# The ranges live in pyproject.toml; this file pins them (including transitive
+# dependencies) so a developer machine, CI and the release build share one set.
+#
+#   python -m pip install -c constraints.txt -e ".[dev]"          # develop / test
+#   python -m pip install -c constraints.txt -e ".[dev,build]"    # also package
+#
+# To update: bump a pin, reinstall, run the full gate (build.ps1), commit this file
+# with the result. Pins must have Windows wheels for every Python CI tests (3.12, 3.13).
+
+# --- runtime -----------------------------------------------------------------
+anyio==4.14.2
+bottle==0.13.4
+certifi==2026.7.22
+cffi==2.1.1
+clr_loader==0.3.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+numpy==2.5.1
+proxy_tools==0.1.0
+PyAudioWPatch==0.2.12.8
+pycparser==3.0
+pythonnet==3.1.0
+pywebview==6.2.1
+pywin32==312
+typing_extensions==4.16.0
+websockets==17.0.1
+
+# --- dev (tests, lint, types) ------------------------------------------------
+ast_serialize==0.7.0
+colorama==0.4.6
+iniconfig==2.3.0
+librt==0.14.0
+mypy==2.3.0
+mypy_extensions==1.1.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+Pygments==2.20.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.1
+
+# --- build (PyInstaller) -----------------------------------------------------
+altgraph==0.17.5
+pefile==2024.8.26
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3
+setuptools==83.0.0

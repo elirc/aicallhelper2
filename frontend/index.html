@@ -6,10 +6,14 @@
          style-src 'unsafe-inline' is required by pywebview/WebView2 bootstrap. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Call Assistant</title>
+    <!-- Paint dark before the stylesheet arrives: no white flash on a cold start. -->
+    <style>
+      html, body { background: #16181d; margin: 0; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from app_core.errors import AppError
-from app_core.llm.base import ProviderFailure
-from app_core.session.machine import Timeouts
+from app_core.llm.base import ProviderFailure, StreamEnd
+from app_core.session.machine import SessionSnapshot, Timeouts
 from tests.conftest import Harness
 
 
@@ -180,15 +182,54 @@ class TestStopContract:
         with pytest.raises(AppError):
             await harness.machine.stop_session("s999")
 
-    async def test_stop_during_connect_not_taken(self, harness: Harness) -> None:
+    async def test_stop_during_connect_is_taken_and_finalizes_once_the_socket_opens(
+        self, harness: Harness
+    ) -> None:
+        """A Stop that lands while Deepgram is still connecting used to be
+        refused, which parked the UI in "Finalizing…" for 20 s and threw the
+        recording away. It is now accepted: the audio captured so far sits in
+        the stream's pre-open buffer, and the finalize is deferred until the
+        socket opens."""
         h = harness
         gate = asyncio.Event()
         h.stt.prepare = lambda s: setattr(s, "connect_gate", gate)
         sid = await h.machine.start_session()
-        with pytest.raises(AppError):
-            await h.machine.stop_session(sid)
-        gate.set()
         await h.settle()
+        h.audio.feed(b"early-frame")
+        await h.machine.stop_session(sid)  # taken, not raised
+        assert h.audio.stops == 1, "capture stops the moment Stop is pressed"
+        assert h.stt.last.finalize_called == 0, "finalize must wait for the socket"
+        h.audio.feed(b"late-frame")  # after Stop: dropped (rule 4)
+        gate.set()
+        await h.drain()
+        assert h.stt.last.finalize_called == 1
+        assert h.stt.last.frames == [b"early-frame"]
+        done = h.sink.named("llm:done")
+        assert [d["sessionId"] for d in done] == [sid]
+        assert h.sink.named("session:error") == []
+        with pytest.raises(AppError):
+            await h.machine.stop_session(sid)  # a second stop is still refused
+
+    async def test_connect_failure_after_a_deferred_stop_still_surfaces(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        gate = asyncio.Event()
+
+        def prep(stream: object) -> None:
+            stream.connect_gate = gate  # type: ignore[attr-defined]
+            stream.connect_error = AppError("stt_connect", "refused")  # type: ignore[attr-defined]
+
+        h.stt.prepare = prep
+        sid = await h.machine.start_session()
+        await h.settle()
+        await h.machine.stop_session(sid)
+        gate.set()
+        await h.drain()
+        errors = h.sink.named("session:error")
+        assert [e["error"]["code"] for e in errors] == ["stt_connect"]
+        assert h.sink.named("llm:done") == []
+        assert h.machine._active is None, "the slot is released"
 
     async def test_second_stop_while_first_runs_not_taken(self, harness: Harness) -> None:
         h = harness
@@ -226,7 +267,10 @@ class TestStopContract:
 
 
 class TestAudioRouting:
-    async def test_frames_after_stop_requested_are_dropped(self, harness: Harness) -> None:
+    async def test_frames_after_the_capture_cutoff_are_dropped(self, harness: Harness) -> None:
+        # Rule 4, redefined by R06: a frame captured before Stop but still
+        # queued for the loop is pre-Stop audio and must reach Deepgram; once
+        # the drain has closed the cutoff, a frame would race CloseStream.
         h = harness
         finalize_gate = asyncio.Event()
         h.stt.prepare = lambda s: setattr(s, "finalize_gate", finalize_gate)
@@ -235,12 +279,66 @@ class TestAudioRouting:
         assert callback is not None
         h.audio.feed(b"good")
         await h.machine.stop_session(sid)
-        # Simulate a frame already in flight when stop landed — it would race
-        # the CloseStream flush (rule 4).
-        callback(b"late", 0.1)
-        assert h.stt.last.frames == [b"good"]
+        callback(b"queued-before-stop", 0.1)  # in flight when Stop landed
+        await h.settle()  # the drain completes; the cutoff closes
+        assert h.stt.last.finalize_called == 1
+        callback(b"late", 0.1)  # after the cutoff: dropped
+        assert h.stt.last.frames == [b"good", b"queued-before-stop"]
         finalize_gate.set()
         await h.drain()
+
+    async def test_drained_tail_reaches_the_stream_before_finalize(
+        self, harness: Harness
+    ) -> None:
+        # R06: the sub-frame remainder the capture holds at Stop is delivered
+        # as a final short frame, BEFORE finalize queues CloseStream.
+        h = harness
+        order: list[str] = []
+        sid = await start_and_connect(h)
+        stt = h.stt.last
+        real_send, real_finalize = stt.send, stt.finalize
+
+        def send(pcm: bytes) -> None:
+            order.append(f"audio:{pcm.decode()}")
+            real_send(pcm)
+
+        async def finalize() -> str:
+            order.append("finalize")
+            return await real_finalize()
+
+        stt.send = send  # type: ignore[method-assign]
+        stt.finalize = finalize  # type: ignore[method-assign]
+        h.audio.feed(b"full")
+        h.audio.tail = b"tail"
+        await h.machine.stop_session(sid)
+        await h.drain()
+        assert order == ["audio:full", "audio:tail", "finalize"]
+        assert h.audio.drains == 1
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid]
+
+    async def test_drained_tail_during_connect_is_buffered_then_finalized(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        gate = asyncio.Event()
+        h.stt.prepare = lambda s: setattr(s, "connect_gate", gate)
+        sid = await h.machine.start_session()
+        await h.settle()
+        h.audio.tail = b"tail"
+        await h.machine.stop_session(sid)
+        gate.set()
+        await h.drain()
+        assert h.stt.last.frames == [b"tail"]
+        assert h.stt.last.finalize_called == 1
+
+    async def test_cancel_discards_instead_of_draining(self, harness: Harness) -> None:
+        h = harness
+        sid = await start_and_connect(h)
+        h.audio.tail = b"tail"
+        h.machine.cancel_session(sid)
+        await h.settle()
+        assert h.audio.drains == 0 and h.audio.stops == 1
+        assert h.stt.last.frames == []
 
     async def test_frames_for_stale_session_dropped(self, harness: Harness) -> None:
         h = harness
@@ -652,21 +750,20 @@ class TestMutationSurvivors:
         await h.drain()
         assert [d["sessionId"] for d in h.sink.named("llm:done")] == [later_sid]
 
-    async def test_frames_arriving_between_stop_request_and_phase_flip_are_dropped(
+    async def test_frames_after_the_cutoff_are_dropped_whatever_the_phase(
         self, harness: Harness
     ) -> None:
-        # _begin_stop sets stop_requested and phase in one synchronous block,
-        # so no loop-driven test can separate them — but a real audio thread
-        # delivers frames into exactly that window. Drive the guard directly.
+        # The cutoff flag alone must reject a frame, even with the phase
+        # still "recording" — drive the guard directly.
         h = harness
         sid = await start_and_connect(h)
         session = h.machine._active
         assert session is not None and session.id == sid
         stt = h.stt.last
-        session.stop_requested = True  # phase deliberately still "recording"
+        session.capture_closed = True  # phase deliberately still "recording"
         h.machine._on_frame(session, b"late-frame", 0.5)
         assert b"late-frame" not in stt.frames
-        session.stop_requested = False
+        session.capture_closed = False
         await h.machine.stop_session(sid)
         await h.drain()
 
@@ -691,3 +788,456 @@ class TestMutationSurvivors:
             if name == "stt:partial":
                 assert payload.get("text") != "nope"
         assert h.sink.named("session:error"), "the error itself must still get out"
+
+
+class TestAnswerTimeMisconfiguration:
+    """Settings can change between Record and Stop: the key checks at start
+    are a courtesy, not a guarantee. Every answer-time failure must surface
+    as a real error and free the slot — never a silent hang in
+    "Finalizing…" and never an LLM call."""
+
+    async def test_provider_removed_mid_session_fails_actionably(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        sid = await start_and_connect(h)
+        h.settings.provider_id = "gone"
+        await h.machine.stop_session(sid)
+        await h.drain()
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "internal"
+        assert "provider" in errors[0]["error"]["message"].lower()
+        assert h.provider.stream_calls == 0
+        assert h.machine._active is None
+
+    async def test_llm_key_removed_mid_session_fails_with_no_llm_key(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        sid = await start_and_connect(h)
+        h.settings.secrets.pop("fake")
+        await h.machine.stop_session(sid)
+        await h.drain()
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "no_llm_key"
+        assert h.provider.stream_calls == 0
+        assert h.machine._active is None
+
+    async def test_a_finalize_that_truly_hangs_times_out_and_frees_the_slot(self) -> None:
+        # The stream enforces its own 5 s flush cap; this is the outer guard
+        # for a finalize() that never returns at all.
+        h = Harness(Timeouts(stt_finalize_s=0.05, llm_first_token_s=1, llm_total_s=1))
+        h.stt.prepare = lambda s: setattr(s, "finalize_gate", asyncio.Event())
+        sid = await start_and_connect(h)
+        await h.machine.stop_session(sid)
+        await h.drain(timeout=4.0)
+        await h.settle()  # the teardown's quiet-abort task runs after release
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "stt_timeout"
+        assert h.provider.stream_calls == 0
+        assert h.machine._active is None
+        assert h.stt.last.aborted, "the hung stream was not torn down"
+
+
+class TestConnectCrashes:
+    async def test_a_non_app_exception_in_connect_surfaces_stt_connect(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        h.stt.prepare = lambda s: setattr(s, "connect_error", RuntimeError("socket exploded"))
+        await h.machine.start_session()
+        await h.drain(0.3)
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "stt_connect"
+        assert "socket exploded" not in errors[0]["error"]["message"]  # no raw internals
+        assert h.audio.stops >= 1
+        assert h.machine._active is None
+
+    async def test_a_non_app_exception_in_connect_after_losing_is_silent(
+        self, harness: Harness
+    ) -> None:
+        # Rule 2: the loser's connect crash belongs to nobody — the winner is
+        # live and must not inherit an error box.
+        h = harness
+        gate = asyncio.Event()
+        h.stt.prepare = lambda s: setattr(s, "connect_gate", gate)
+        first = await h.machine.start_session()
+        await h.settle()
+        loser = h.stt.last
+        h.stt.prepare = None
+        second = await h.machine.start_session()
+        await h.settle()
+        assert h.machine._active is not None and h.machine._active.id == second
+        loser.connect_error = RuntimeError("late crash")  # type: ignore[assignment]
+        gate.set()
+        await h.drain(0.3)
+        assert h.sink.named("session:error") == []
+        assert loser.aborted
+        assert h.machine._active is not None and h.machine._active.id == second
+        assert first != second
+
+
+def _replace_stream(h: Harness, items: list[object]) -> None:
+    """Make the fake provider yield exactly `items` (strings and/or StreamEnd)."""
+
+    async def stream(request: object, http: object) -> AsyncIterator[object]:
+        h.provider.stream_calls += 1
+        for item in items:
+            yield item
+
+    h.provider.stream = stream  # type: ignore[assignment, method-assign]
+
+
+class TestAnswerCompletion:
+    """R03 at the session boundary: llm:done carries how the answer ended,
+    and an empty answer is an error, never a finished blank entry."""
+
+    async def test_done_reports_a_complete_finish(self, harness: Harness) -> None:
+        h = harness
+        await h.machine.ask("q")
+        await h.drain()
+        done = h.sink.named("llm:done")
+        assert len(done) == 1 and done[0]["finish"] == "complete"
+        assert done[0]["answer"] == "Hello world."
+
+    async def test_a_token_limit_answer_is_done_but_marked_truncated(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        _replace_stream(h, ["Cut off mid", StreamEnd("truncated", "max_tokens")])
+        await h.machine.ask("q")
+        await h.drain()
+        done = h.sink.named("llm:done")
+        assert len(done) == 1
+        assert done[0]["finish"] == "truncated" and done[0]["answer"] == "Cut off mid"
+        assert h.sink.named("session:error") == []
+
+    async def test_an_empty_answer_is_a_session_error_not_a_blank_done(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        _replace_stream(h, [StreamEnd("complete", "end_turn")])
+        await h.machine.ask("q")
+        await h.drain()
+        assert h.sink.named("llm:done") == []
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1 and errors[0]["error"]["code"] == "llm_http"
+        assert h.machine._active is None  # slot released
+        assert h.provider.stream_calls == 1  # the server heard us: no retry
+
+    async def test_an_in_stream_error_after_text_is_an_error_with_the_partial_painted(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        h.provider.fail_after_first_delta = ProviderFailure("provider_error")
+        await h.machine.ask("q")
+        await h.drain()
+        assert [d["delta"] for d in h.sink.named("llm:delta")] == ["Hello "]
+        assert h.sink.named("llm:done") == []
+        assert len(h.sink.named("session:error")) == 1
+        assert h.provider.stream_calls == 1
+
+
+class TestStaleCommandCleanup:
+    """R04, backend half: a late response for an older command may clean up
+    only the session it identifies — never the newer one."""
+
+    async def test_a_late_aborted_start_leaves_the_newer_recording_untouched(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        gate = threading.Event()
+        first = {"pending": True}
+        real_get = h.settings.get_secret
+
+        def stalling_get(secret_id: str) -> str | None:
+            if first["pending"]:
+                first["pending"] = False
+                gate.wait(timeout=5.0)
+            return real_get(secret_id)
+
+        h.settings.get_secret = stalling_get  # type: ignore[method-assign]
+        early = asyncio.get_running_loop().create_task(h.machine.start_session())
+        await h.settle()
+        later = await start_and_connect(h)
+        stops_before = h.audio.stops
+        gate.set()
+        with pytest.raises(AppError) as info:
+            await early
+        assert info.value.code == "aborted"
+        await h.settle()
+        # The loser never installed anything, so it had nothing to clean up —
+        # and it must not have touched the winner.
+        assert len(h.stt.streams) == 1 and not h.stt.last.aborted
+        assert h.audio.stops == stops_before
+        assert h.machine._active is not None and h.machine._active.id == later
+        await h.machine.stop_session(later)
+        await h.drain()
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [later]
+
+    async def test_a_late_cancel_for_a_superseded_id_never_cancels_the_newer_session(
+        self, harness: Harness
+    ) -> None:
+        # The frontend's stale-success path: A resolved as s1 after the user
+        # cancelled and started B; its cleanup is cancel(s1), sent after B.
+        h = harness
+        old = await start_and_connect(h)
+        new = await start_and_connect(h)
+        new_stream = h.stt.last
+        h.machine.cancel_session(old)
+        await h.settle()
+        assert not new_stream.aborted
+        assert h.machine._active is not None and h.machine._active.id == new
+        await h.machine.stop_session(new)
+        await h.drain()
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [new]
+        assert h.sink.named("session:error") == []
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0  # exact float arithmetic for the ms assertions
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _threaded_harness(audio_drain_s: float = 2.0) -> Harness:
+    return Harness(
+        Timeouts(
+            stt_finalize_s=0.5,
+            llm_first_token_s=1.0,
+            llm_total_s=2.0,
+            audio_drain_s=audio_drain_s,
+        ),
+        audio_executor=ThreadPoolExecutor(max_workers=1),
+    )
+
+
+async def _wait_for(predicate: Callable[[], bool], why: str, timeout: float = 3.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, why
+        await asyncio.sleep(0.01)
+
+
+class TestAudioLifecycle:
+    """R06 + R10: the Stop drain, and the device lifecycle off the loop."""
+
+    async def _stop_to_answer_metrics(self, drain_s: float) -> dict[str, int]:
+        # A fake monotonic clock that only the drain advances: every metric
+        # is then exact, so the test measures attribution, not scheduling.
+        h = Harness(Timeouts(stt_finalize_s=0.5, llm_first_token_s=1.0, llm_total_s=2.0))
+        clock = _FakeClock()
+        h.machine._clock = clock
+        real_drain = h.audio.stop_and_drain
+
+        def slow_drain() -> None:
+            clock.now += drain_s
+            real_drain()
+
+        h.audio.stop_and_drain = slow_drain  # type: ignore[method-assign]
+        sid = await start_and_connect(h)
+        await h.machine.stop_session(sid)
+        await h.drain()
+        (done,) = h.sink.named("llm:done")
+        metrics: dict[str, int] = done["metrics"]
+        return metrics
+
+    async def test_a_known_drain_delay_is_counted_in_stop_to_first_token(self) -> None:
+        # Review §8: the Stop timestamp stays BEFORE the drain. A drain that
+        # takes 400 ms must add exactly 400 ms to firstTokenMs/totalMs and be
+        # reported as audioDrainMs — never folded into sttFinalizeMs.
+        fast = await self._stop_to_answer_metrics(0.0)
+        slow = await self._stop_to_answer_metrics(0.4)
+        assert slow["audioDrainMs"] - fast["audioDrainMs"] == 400
+        assert slow["firstTokenMs"] - fast["firstTokenMs"] == 400
+        assert slow["totalMs"] - fast["totalMs"] == 400
+        assert slow["sttFinalizeMs"] == fast["sttFinalizeMs"] == 0
+
+    async def test_a_slow_device_open_does_not_block_the_loop_or_the_connect(self) -> None:
+        h = _threaded_harness()
+        opened = threading.Event()
+        real_start = h.audio.start
+
+        def slow_start(on_frame: Callable[[bytes, float], None]) -> None:
+            opened.wait(timeout=5.0)
+            real_start(on_frame)
+
+        h.audio.start = slow_start  # type: ignore[method-assign]
+        sid = await h.machine.start_session()
+        await h.settle()
+        # The device is still opening on the worker, yet the loop ran the
+        # STT handshake to completion in parallel.
+        assert h.stt.last.connected
+        assert h.audio.starts == 0
+        assert h.sink.named("session:recording") == [], "cap armed before capture"
+        opened.set()
+        await _wait_for(lambda: bool(h.sink.named("session:recording")), "never armed")
+        assert [p["sessionId"] for p in h.sink.named("session:recording")] == [sid]
+        await h.machine.stop_session(sid)
+        await h.drain()
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid]
+
+    async def test_a_slow_drain_does_not_block_the_loop_and_its_tail_precedes_finalize(
+        self,
+    ) -> None:
+        h = _threaded_harness()
+        loop = asyncio.get_running_loop()
+        h.audio.loop = loop
+        h.audio.tail = b"tail"
+        h.audio.drain_delay_s = 0.3
+        sid = await h.machine.start_session()
+        await _wait_for(
+            lambda: h.audio.starts == 1 and h.stt.last.connected, "never started"
+        )
+        h.audio.feed(b"full")
+        await h.machine.stop_session(sid)
+        began = loop.time()
+        await asyncio.sleep(0.02)
+        assert loop.time() - began < 0.25, "the loop blocked on the device drain"
+        assert h.stt.last.finalize_called == 0, "finalize must wait for the drain"
+        await h.drain(3.0)
+        assert h.stt.last.frames == [b"full", b"tail"]
+        assert h.stt.last.finalize_called == 1
+        (done,) = h.sink.named("llm:done")
+        assert done["metrics"]["audioDrainMs"] >= 250
+
+    async def test_a_hung_drain_is_bounded_and_the_answer_still_arrives(self) -> None:
+        h = _threaded_harness(audio_drain_s=0.1)
+        h.audio.drain_delay_s = 1.0
+        sid = await h.machine.start_session()
+        await _wait_for(
+            lambda: h.audio.starts == 1 and h.stt.last.connected, "never started"
+        )
+        await h.machine.stop_session(sid)
+        await h.drain(0.9)  # well inside the 1 s hang
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid]
+
+    async def test_stop_while_the_device_is_still_opening_drains_after_the_open(
+        self,
+    ) -> None:
+        # The single audio worker serializes: the drain queued by Stop runs
+        # after the slow open, so the device is never left open.
+        h = _threaded_harness()
+        opened = threading.Event()
+        real_start = h.audio.start
+
+        def slow_start(on_frame: Callable[[bytes, float], None]) -> None:
+            opened.wait(timeout=5.0)
+            real_start(on_frame)
+
+        h.audio.start = slow_start  # type: ignore[method-assign]
+        sid = await h.machine.start_session()
+        await h.settle()
+        await h.machine.stop_session(sid)
+        opened.set()
+        await h.drain(3.0)
+        assert h.audio.starts == 1 and h.audio.drains == 1
+        assert h.audio.on_frame is None, "device left open after Stop"
+        assert h.sink.named("session:recording") == [], "cap armed after Stop"
+        assert h.sink.named("session:error") == []
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid]
+
+    async def test_the_cap_runs_from_capture_start_even_while_connect_hangs(self) -> None:
+        h = Harness(
+            Timeouts(
+                stt_finalize_s=0.5, llm_first_token_s=1.0, llm_total_s=2.0, record_cap_s=0.1
+            )
+        )
+        gate = asyncio.Event()
+        h.stt.prepare = lambda s: setattr(s, "connect_gate", gate)
+        sid = await h.machine.start_session()
+        await asyncio.sleep(0.3)
+        # Previously the cap armed only after connect, so this never fired.
+        assert [p["sessionId"] for p in h.sink.named("session:autostopped")] == [sid]
+        assert h.audio.drains == 1
+        gate.set()
+        await h.drain()
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid]
+
+    async def test_recording_event_carries_one_core_deadline(self, harness: Harness) -> None:
+        h = harness
+        h.machine._wall_clock = lambda: 5000.0
+        sid = await start_and_connect(h)
+        (event,) = h.sink.named("session:recording")
+        assert event == {"sessionId": sid, "deadlineMs": 5_030_000, "capMs": 30_000}
+        await h.machine.stop_session(sid)
+        await h.drain()
+
+    async def test_a_device_open_failure_after_a_supersede_is_silent(self) -> None:
+        h = _threaded_harness()
+        release = threading.Event()
+
+        def failing_start(on_frame: Callable[[bytes, float], None]) -> None:
+            release.wait(timeout=5.0)
+            raise RuntimeError("device vanished")
+
+        h.audio.start = failing_start  # type: ignore[method-assign]
+        await h.machine.start_session()
+        await h.settle()
+        sid2 = await h.machine.ask("typed instead")  # supersedes mid-open
+        release.set()
+        await h.drain()
+        await asyncio.sleep(0.1)  # let the failed open's callback land
+        assert h.sink.named("session:error") == []
+        assert [d["sessionId"] for d in h.sink.named("llm:done")] == [sid2]
+
+    async def test_a_device_open_failure_after_an_early_stop_is_reported_not_no_speech(
+        self,
+    ) -> None:
+        # No default output device + Record, Stop inside the open window: the
+        # empty transcript must be reported as the device error the user can
+        # fix, not "No speech detected — make sure call audio is playing".
+        h = _threaded_harness()
+        h.stt.prepare = lambda s: setattr(s, "transcript", "")
+        release = threading.Event()
+
+        def failing_start(on_frame: Callable[[bytes, float], None]) -> None:
+            release.wait(timeout=5.0)
+            raise RuntimeError("no default output device")
+
+        h.audio.start = failing_start  # type: ignore[method-assign]
+        sid = await h.machine.start_session()
+        await h.settle()
+        await h.machine.stop_session(sid)
+        release.set()
+        await h.drain(3.0)
+        errors = h.sink.named("session:error")
+        assert len(errors) == 1, errors
+        assert "system audio device" in errors[0]["error"]["message"]
+        assert errors[0]["error"]["code"] != "no_speech"
+
+
+class TestActiveSnapshot:
+    """The public read-only accessor the bridge status and shell shutdown use
+    instead of reaching into `_active`."""
+
+    async def test_it_tracks_the_live_slot_through_its_lifecycle(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        assert h.machine.active_snapshot() is None
+        sid = await start_and_connect(h)
+        snap = h.machine.active_snapshot()
+        assert snap == SessionSnapshot(id=sid, kind="record", phase="recording")
+        await h.machine.stop_session(sid)
+        finalizing = h.machine.active_snapshot()
+        assert finalizing is not None and finalizing.id == sid
+        assert finalizing.phase in ("finalizing", "answering")
+        await h.drain()
+        assert h.machine.active_snapshot() is None  # released after done
+
+    async def test_a_cancelled_session_reads_as_idle_and_the_copy_is_immutable(
+        self, harness: Harness
+    ) -> None:
+        h = harness
+        h.provider.post_delta_hang = asyncio.Event()
+        sid = await h.machine.ask("q")
+        snap = h.machine.active_snapshot()
+        assert snap is not None and snap.kind == "ask" and snap.phase == "answering"
+        with pytest.raises(AttributeError):
+            snap.phase = "done"  # type: ignore[misc]
+        h.machine.cancel_session(sid)
+        assert h.machine.active_snapshot() is None

@@ -116,6 +116,51 @@ class TestRegistrationStatus:
             first.unregister()
         assert first.status == "disabled"
 
+    def test_a_registration_that_finishes_after_the_wait_is_undone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a loaded machine RegisterHotKey can outlast register()'s wait.
+        It used to report "unavailable" while the orphaned thread went on to
+        hold the key in a message loop nothing could stop — it fired, and
+        blocked every later registration of that key."""
+        import ctypes
+        import threading
+        import time
+
+        import app_core.bridge.hotkey as hotkey_module
+
+        calls: list[str] = []
+        finished = threading.Event()
+
+        class SlowUser32:
+            def RegisterHotKey(self, *_a: object) -> int:
+                time.sleep(0.3)
+                calls.append("register")
+                return 1
+
+            def UnregisterHotKey(self, *_a: object) -> int:
+                calls.append("unregister")
+                finished.set()
+                return 1
+
+            def GetMessageW(self, *_a: object) -> int:
+                calls.append("message-loop")
+                finished.set()
+                return 0
+
+        class Kernel32:
+            def GetCurrentThreadId(self) -> int:
+                return 4242
+
+        fake = type("WinDll", (), {"user32": SlowUser32(), "kernel32": Kernel32()})()
+        monkeypatch.setattr(ctypes, "windll", fake, raising=False)
+        monkeypatch.setattr(hotkey_module, "REGISTER_TIMEOUT_S", 0.05)
+        manager = HotkeyManager(lambda: None)
+        assert manager.register("Ctrl+Alt+Shift+F23") == "unavailable"
+        assert finished.wait(3.0)
+        assert calls == ["register", "unregister"], calls
+        assert manager.registered is False
+
     def test_f_key_parsing_rejects_non_ascii_numerals(self) -> None:
         # str.isdigit() is True for 128 codepoints int() rejects, so "f²"
         # raised ValueError out of a parser documented never to raise; and

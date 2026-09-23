@@ -37,11 +37,14 @@ async function askRound(question: string, answer: string): Promise<string> {
 }
 
 describe("history", () => {
-  it("is hidden until there are 2+ entries", async () => {
+  it("offers Clear from one entry; navigation only from two", async () => {
     await renderApp();
     expect(screen.queryByText("Clear")).toBeNull();
     await askRound("q one", "a one");
-    expect(screen.queryByText("Clear")).toBeNull();
+    // A single answer must be clearable too (review §5).
+    expect(screen.getByText("Clear")).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Previous answer" })).toBeNull();
+    expect(screen.queryByText("1/1")).toBeNull();
     await askRound("q two", "a two");
     expect(screen.getByText("Clear")).toBeInTheDocument();
     expect(screen.getByText("2/2")).toBeInTheDocument();
@@ -108,8 +111,8 @@ describe("history", () => {
       error: { code: "stt_connect", message: "Could not connect." },
     });
     await settle();
-    // Only the one real entry remains -> history bar still hidden.
-    expect(screen.queryByText("Clear")).toBeNull();
+    // Only the one real entry remains -> no navigation, no husk entry.
+    expect(screen.queryByRole("button", { name: "Previous answer" })).toBeNull();
     expect(screen.getByText("a one")).toBeInTheDocument();
   });
 

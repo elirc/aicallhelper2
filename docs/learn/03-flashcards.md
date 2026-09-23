@@ -168,17 +168,23 @@ the first spoken word. (And `reasoning_format` is a Qwen-family knob — do
 not send it.)
 
 **Q30. Groq returns 404. What's the likely cause and the fix?**
-A: Groq retires models on short notice — update the pinned `MODEL`
-constant in `app_core/llm/groq.py`. The error message says exactly this.
+A: Groq retires models on short notice. For USERS the error names the
+retired model and says to switch the answer provider to Claude in Settings
+or install the latest version — an installed-app user cannot edit source.
+For MAINTAINERS the fix is the pinned `MODEL` constant in
+`app_core/llm/groq.py`, then a new release.
 
 **Q31. What does the pre-warm actually do, and why read the body?**
 A: Fire-and-forget `GET <origin>/v1/models` (3 s timeout, throttled 2 s
 per origin) through the SHARED httpx client; reading the body returns the
 connection to the pool so the answer request finds a live TLS connection.
 
-**Q32. Name the five `ProviderFailure` kinds and the single retryable
+**Q32. Name the eight `ProviderFailure` kinds and the single retryable
 one.**
-A: `connect` · `timeout` · `status` · `stream_drop` · `empty_body`. Only
+A: `connect` · `timeout` · `status` · `stream_drop` · `empty_body` ·
+`provider_error` (error event inside a 200 stream) · `incomplete` (stream
+ended before the provider's terminal event) · `empty_answer` (finished
+with no usable text; raised by `retry.py`). Only
 `connect` retries — it means the request never left us (httpx
 ConnectError / ConnectTimeout / PoolTimeout before the response started).
 
@@ -388,13 +394,16 @@ or the tail of the answer would land after its own terminal event.
 
 ## Product behavior & UI
 
-**Q66. When does the latency clock start and what are the three
+**Q66. When does the latency clock start and what are the four
 metrics?**
-A: At stop-request. `sttFinalizeMs` (stop→final transcript),
-`firstTokenMs` (stop→first delta), `totalMs` (stop→answer complete).
+A: At Stop acceptance, BEFORE the audio drain (the user waits for it).
+`audioDrainMs` (Stop→pre-Stop audio delivered, device closed),
+`sttFinalizeMs` (drain complete→final transcript), `firstTokenMs`
+(Stop→first delta), `totalMs` (Stop→answer complete).
 
 **Q67. Two metric honesty rules?**
-A: Typed questions report `sttFinalizeMs` exactly 0 (no STT stage); a
+A: Typed questions report `audioDrainMs` and `sttFinalizeMs` exactly 0
+(no audio or STT stage); a
 no-delta answer reports `firstTokenMs = totalMs`, never 0 — 0 renders as
 "instant" and lies.
 

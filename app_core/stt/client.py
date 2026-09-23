@@ -38,8 +38,8 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 from websockets.typing import Subprotocol
 
+from app_core.contracts import OnSttError, OnSttUpdate
 from app_core.errors import AppError
-from app_core.session.machine import OnSttError, OnSttUpdate
 from app_core.stt.frames import (
     SttErrorDetail,
     TranscriptAccumulator,
@@ -122,6 +122,14 @@ class DeepgramStream:
                 "stt_connect",
                 "Could not connect to Deepgram. Check the API key and your network.",
             ) from exc
+        if self._aborted:
+            # abort() landed while the handshake was in flight. Nobody wants
+            # this socket now: close it instead of spawning reader/sender/
+            # keepalive tasks that would pin it open until Deepgram's idle
+            # timeout, and never report the close as an error.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._ws.close(), timeout=2.0)
+            return
         loop = asyncio.get_running_loop()
         self._tasks.append(loop.create_task(self._reader()))
         self._tasks.append(loop.create_task(self._sender()))

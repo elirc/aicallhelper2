@@ -1,8 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ai-call-assistant"
-version = "3.0.0"
+# THE version. frontend/package.json, its lockfile, installer.iss and the exe's
+# version resource must agree; tools/release_meta.py check (run by CI and by
+# tests/test_release_metadata.py) fails on drift.
+version = "3.1.0"
 description = "Push-to-record interview copilot for Windows (Python core + pywebview shell)"
 requires-python = ">=3.12"
+# Runtime dependencies. Exact tested versions live in constraints.txt; install with
+#   python -m pip install -c constraints.txt -e ".[dev]"
+dependencies = [
+    "httpx>=0.28",
+    "numpy>=2.0",
+    "PyAudioWPatch>=0.2.12",
+    "pywebview>=6.0",
+    "pywin32>=306",
+    "websockets>=14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.15",
+    "pytest>=8",
+    "pytest-asyncio>=0.26",
+    "ruff>=0.11",
+]
+build = [
+    "pyinstaller>=6.10",
+]
+
+# Editable installs only; the app ships as a PyInstaller folder, never as a wheel.
+[tool.setuptools]
+py-modules = ["app"]
+
+[tool.setuptools.packages.find]
+include = ["app_core*"]
 
 [tool.ruff]
 line-length = 100
@@ -18,7 +53,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["app_core", "app.py"]
+files = ["app_core", "app.py", "tools"]
 exclude = "(\\.venv|frontend|build|dist)"
 
 [[tool.mypy.overrides]]

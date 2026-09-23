@@ -6,7 +6,13 @@ import base64
 
 import pytest
 
-from app_core.store.secrets import Keystore, decode_secret, encode_secret
+from app_core.store.secrets import (
+    Keystore,
+    SecretEncryptionError,
+    decode_secret,
+    encode_secret,
+    secret_storage,
+)
 
 
 class XorKeystore:
@@ -43,14 +49,21 @@ class TestEncode:
         assert stored.startswith("enc:")
         assert decode_secret(stored, ks) == "sk-abc123"
 
-    def test_keystore_unavailable_falls_back_to_marked_plain(self) -> None:
-        stored = encode_secret("sk-abc123", None)
-        assert stored.startswith("plain:")
-        assert decode_secret(stored, None) == "sk-abc123"
+    def test_keystore_unavailable_fails_closed(self) -> None:
+        # R02: the old fallback silently stored decodable plaintext while the
+        # UI promised encryption. Now the caller must fail the save.
+        with pytest.raises(SecretEncryptionError):
+            encode_secret("sk-abc123", None)
 
-    def test_failing_keystore_falls_back_to_marked_plain(self) -> None:
-        stored = encode_secret("sk-abc123", BrokenKeystore())
-        assert stored.startswith("plain:")
+    def test_failing_keystore_fails_closed(self) -> None:
+        with pytest.raises(SecretEncryptionError):
+            encode_secret("sk-abc123", BrokenKeystore())
+
+    def test_storage_kind_is_read_from_the_prefix(self, ks: Keystore) -> None:
+        assert secret_storage(encode_secret("k", ks)) == "encrypted"
+        assert secret_storage("plain:" + base64.b64encode(b"k").decode()) == "plaintext"
+        assert secret_storage("v2:x") is None
+        assert secret_storage(None) is None
 
     def test_key_material_never_stored_raw(self, ks: Keystore) -> None:
         stored = encode_secret("sk-abc123", ks)

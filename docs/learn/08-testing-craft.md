@@ -1,6 +1,7 @@
 # 08 — Testing craft: tests that actually hold
 
-This codebase runs 297 core + 148 frontend tests, all green. It also
+This codebase runs several hundred core and frontend tests (current counts:
+`docs/TESTING.md`), all green. It also
 shipped for four commits with the line that delivers every event to the
 page missing, and a mutation pass later proved that 7 of 18 deliberate
 defects survived the entire green suite. Both facts are in the git log.
